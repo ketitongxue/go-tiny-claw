@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
+	"github.com/ketitongxue/go-tiny-claw/internal/feishu"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/tools"
 )
@@ -30,21 +31,15 @@ func main() {
 	registry.Register(tools.NewReadFileTool(workDir))
 	registry.Register(tools.NewWriteFileTool(workDir))
 	registry.Register(tools.NewBashTool(workDir))
+	registry.Register(tools.NewEditFileTool(workDir))
 
 	// 5. 实例化核心引擎，由于任务简单，我们关闭思考阶段 (EnableThinking = false) 以加快速度
-	eng := engine.NewAgentEngine(llmProvider, registry, workDir, false)
+	eng := engine.NewAgentEngine(llmProvider, registry, workDir, true)
 
-	// 6. 下发一个必须通过真实工具才能完成的任务
-	prompt := `
-    请帮我执行以下操作：
-    1. 用 bash 查看一下我当前电脑的 Go 版本。
-    2. 帮我写一个简单的 helloworld.go 文件，输出 "Hello, go-tiny-claw!"。
-    3. 用 bash 编译并运行这个 go 文件，确认它能正常工作。
-    `
-
-	// 发起任务指令
-	err := eng.Run(context.Background(), prompt)
-	if err != nil {
-		log.Fatalf("引擎崩溃: %v", err)
+	// 6. 初始化飞书 Bot，并通过长连接接收事件
+	bot := feishu.NewFeishuBot(eng)
+	log.Println("🚀 go-tiny-claw 正在启动飞书事件长连接")
+	if err := bot.StartLongConnection(context.Background()); err != nil {
+		log.Fatalf("飞书长连接崩溃: %v", err)
 	}
 }
