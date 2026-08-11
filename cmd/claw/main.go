@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
-	"fmt"
 	"log"
 	"os"
 
@@ -15,15 +13,6 @@ import (
 )
 
 func main() {
-	// 通过命令行参数接收用户的 prompt
-	promptPtr := flag.String("prompt", "", "要交给 Agent 执行的任务描述")
-	flag.Parse()
-
-	if *promptPtr == "" {
-		fmt.Println("用法: go run cmd/claw/main.go -prompt \"你的任务指令\"")
-		os.Exit(1)
-	}
-
 	// 确保已设置 ZHIPU_API_KEY
 	if os.Getenv("ZHIPU_API_KEY") == "" {
 		log.Fatal("请先导出 ZHIPU_API_KEY 环境变量")
@@ -47,22 +36,36 @@ func main() {
 	registry.Register(tools.NewEditFileTool(workDir))
 
 	// 5. 实例化核心引擎，由于任务简单，我们关闭思考阶段 (EnableThinking = false) 以加快速度
-	eng := engine.NewAgentEngine(llmProvider, registry, false, true)
+	eng := engine.NewAgentEngine(llmProvider, registry, false, false)
 	// 【注入新实现的终端输出器】
 	reporter := engine.NewTerminalReporter()
 
 	// 我们使用一个固定的 SessionID，以便在多次运行之间共享基于内存的“短期工作记忆”。
 	// (在真实的 CLI 中，如果进程重启，Session 的内存历史其实是丢失的。
 	// 但这正是我们要演示的重点：即便短期内存丢失，只要 TODO.md 还在，任务就能继续！)
-	sessionID := "task_web_server_01"
+	sessionID := "test_recovery_001"
 	sess := ctxpkg.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
 
-	log.Printf("\n>>> 🚀 收到指令: %s\n", *promptPtr)
+	// 这是一个安全的自愈测试任务：只操作独立的健康检查示例，
+	// 覆盖文件创建、读取、局部编辑和测试流程，不触碰鉴权或其他安全边界。
+	prompt := `
+    请在当前工作区创建一个独立的 Go 健康检查示例 healthcheck.go。
+    1. 先用 bash 检查 healthcheck.go 是否存在。
+    2. 如果不存在，使用 write_file 创建以下内容：
 
-	// 将用户的 Prompt 压入 Session
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: *promptPtr})
+    package main
 
-	// 唤醒引擎执行
+    func healthStatus() string {
+        return "ok"
+    }
+
+    3. 使用 read_file 读取 healthcheck.go，再用 edit_file 将返回值从 "ok" 修改为 "healthy"。
+    4. 使用 bash 执行 gofmt -w healthcheck.go 和 go test ./...。
+    整个任务只能操作 healthcheck.go，不要修改鉴权、登录、权限、凭据或其他文件。
+`
+	log.Println("\n>>> 🚀 启动安全自愈测试任务...")
+	sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
+
 	err := eng.Run(context.Background(), sess, reporter)
 	if err != nil {
 		log.Fatalf("引擎运行崩溃: %v", err)
