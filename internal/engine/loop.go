@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
@@ -17,8 +18,9 @@ type AgentEngine struct {
 	provider       provider.LLMProvider
 	registry       tools.Registry
 	EnableThinking bool
-	PlanMode       bool              // 【新增】暴露给外部的计划模式开关
-	compactor      *ctxpkg.Compactor // 【新增】压缩器实例
+	PlanMode       bool                    // 【新增】暴露给外部的计划模式开关
+	compactor      *ctxpkg.Compactor       // 【新增】压缩器实例
+	recovery       *ctxpkg.RecoveryManager // 【新增】自愈管理器
 }
 
 // 【注意】：我们移除了 Engine 层级的 WorkDir，因为 WorkDir 现在应该跟随 Session 走！
@@ -31,6 +33,7 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 		// 【初始化压缩器】：为了便于今天的极端测试，我们将水位线阈值设积极（例如 3000 字符），
 		// 并保护最近的 6 条消息（大约两轮 Turn 的交互）
 		compactor: ctxpkg.NewCompactor(3000, 6),
+		recovery:  ctxpkg.NewRecoveryManager(), // 初始化 Recovery
 	}
 }
 
@@ -57,6 +60,8 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		// 无论你带出了多少上下文，如果字符总数超标，早期日志将被掩码化，超大日志将被掐头去尾
 		compactedContext := e.compactor.Compact(contextHistory)
 
+		var currentTurnThinkingContent string
+
 		// 3. 后续的 Provider.Generate 全面使用被保护过的新鲜上下文 (compactedContext)
 		// ================= Phase 1: Thinking =================
 		if e.EnableThinking {
@@ -69,10 +74,8 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 				return fmt.Errorf("Thinking 阶段失败: %w", err)
 			}
 			if thinkResp.Content != "" {
-				// 将思考过程持久化到 Session 中！
-				session.Append(*thinkResp)
-				// 把它追加到当前这一轮的临时上下文中，供 Action 阶段使用
-				contextHistory = append(compactedContext, *thinkResp)
+				currentTurnThinkingContent = thinkResp.Content
+				compactedContext = append(compactedContext, *thinkResp)
 			}
 		}
 
@@ -82,9 +85,15 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 			return fmt.Errorf("Action 阶段失败: %w", err)
 		}
 
+		// (上一讲修复 1214 的关键代码：合并为合法的单条 Assistant 消息)
+		finalAssistantMsg := schema.Message{
+			Role:      schema.RoleAssistant,
+			Content:   strings.TrimSpace(currentTurnThinkingContent + "\n" + actionResp.Content),
+			ToolCalls: actionResp.ToolCalls,
+		}
+
 		// 将大模型的行动响应持久化到 Session 中
-		session.Append(*actionResp)
-		contextHistory = append(compactedContext, *actionResp)
+		session.Append(finalAssistantMsg)
 
 		if actionResp.Content != "" && reporter != nil {
 			reporter.OnMessage(ctx, actionResp.Content)
