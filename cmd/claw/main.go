@@ -43,27 +43,18 @@ func main() {
 	// 我们使用一个固定的 SessionID，以便在多次运行之间共享基于内存的“短期工作记忆”。
 	// (在真实的 CLI 中，如果进程重启，Session 的内存历史其实是丢失的。
 	// 但这正是我们要演示的重点：即便短期内存丢失，只要 TODO.md 还在，任务就能继续！)
-	sessionID := "test_recovery_001"
+	sessionID := "test_doom_loop_001"
 	sess := ctxpkg.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
 
 	// 这是一个安全的自愈测试任务：只操作独立的健康检查示例，
 	// 覆盖文件创建、读取、局部编辑和测试流程，不触碰鉴权或其他安全边界。
 	prompt := `
-    请在当前工作区创建一个独立的 Go 健康检查示例 healthcheck.go。
-    1. 先用 bash 检查 healthcheck.go 是否存在。
-    2. 如果不存在，使用 write_file 创建以下内容：
+    帮我读取当前目录下的 secret_key.txt。
+    注意：我们的文件系统现在非常不稳定，经常报 File Not Found。
+    如果报错了，请你【千万不要改变参数】，直接原样再次调用 read_file 尝试，直到成功或连续重试 5 次为止。
+	`
 
-    package main
-
-    func healthStatus() string {
-        return "ok"
-    }
-
-    3. 使用 read_file 读取 healthcheck.go，再用 edit_file 将返回值从 "ok" 修改为 "healthy"。
-    4. 使用 bash 执行 gofmt -w healthcheck.go 和 go test ./...。
-    整个任务只能操作 healthcheck.go，不要修改鉴权、登录、权限、凭据或其他文件。
-`
-	log.Println("\n>>> 🚀 启动安全自愈测试任务...")
+	log.Println("\n>>> 🚀 启动死循环干预测试...")
 	sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
 
 	err := eng.Run(context.Background(), sess, reporter)
