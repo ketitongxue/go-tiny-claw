@@ -7,6 +7,7 @@ import (
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
+	"github.com/ketitongxue/go-tiny-claw/internal/feishu"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 	"github.com/ketitongxue/go-tiny-claw/internal/tools"
@@ -38,34 +39,41 @@ func main() {
 	// 5. 实例化核心引擎，由于任务简单，我们关闭思考阶段 (EnableThinking = false) 以加快速度
 	eng := engine.NewAgentEngine(llmProvider, registry, false, false)
 	// 【注入新实现的终端输出器】
-	reporter := engine.NewTerminalReporter()
+	// reporter := engine.NewTerminalReporter()
 
 	// 我们使用一个固定的 SessionID，以便在多次运行之间共享基于内存的“短期工作记忆”。
 	// (在真实的 CLI 中，如果进程重启，Session 的内存历史其实是丢失的。
 	// 但这正是我们要演示的重点：即便短期内存丢失，只要 TODO.md 还在，任务就能继续！)
-	sessionID := "test_doom_loop_001"
+	sessionID := "test_command_intercept_001"
 	sess := ctxpkg.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
-
-	// 这是一个安全的自愈测试任务：只操作独立的健康检查示例，
-	// 覆盖文件创建、读取、局部编辑和测试流程，不触碰鉴权或其他安全边界。
-	prompt := `
-    帮我读取当前目录下的 secret_key.txt。
-    注意：我们的文件系统现在非常不稳定，经常报 File Not Found。
-    如果报错了，请你【千万不要改变参数】，直接原样再次调用 read_file 尝试，直到成功或连续重试 5 次为止。
-	`
-
-	log.Println("\n>>> 🚀 启动死循环干预测试...")
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
-
-	err := eng.Run(context.Background(), sess, reporter)
-	if err != nil {
-		log.Fatalf("引擎运行崩溃: %v", err)
-	}
+	sess.Append(schema.Message{Role: schema.RoleUser, Content: ""})
 
 	// 6. 初始化飞书 Bot，并通过长连接接收事件
-	// bot := feishu.NewFeishuBot(eng)
-	// log.Println("🚀 go-tiny-claw 正在启动飞书事件长连接")
-	// if err := bot.StartLongConnection(context.Background()); err != nil {
-	// 	log.Fatalf("飞书长连接崩溃: %v", err)
-	// }
+	bot := feishu.NewFeishuBot(eng, sess)
+
+	// 【核心注入】注册安全拦截 Middleware
+	registry.Use(func(ctx context.Context, call schema.ToolCall) (bool, string) {
+		argsStr := string(call.Arguments)
+
+		// 检查是否命中高危特征库
+		if feishu.IsDangerousCommand(call.Name, argsStr) {
+			taskID := call.ID // 使用大模型生成的唯一 ToolCallID 作为 TaskID
+
+			// 挂起当前协程，发送消息给飞书，死死等待人类的审批！
+			allowed, reason := feishu.GlobalApprovalMgr.WaitForApproval(taskID, call.Name, argsStr, bot.Reporter())
+
+			if !allowed {
+				return false, reason // 拒绝，将理由传回给大模型
+			}
+			return true, "" // 同意，放行底层工具
+		}
+
+		// 没命中黑名单，直接 YOLO 放行
+		return true, ""
+	})
+
+	log.Println("🚀 go-tiny-claw 正在启动飞书事件长连接")
+	if err := bot.StartLongConnection(context.Background()); err != nil {
+		log.Fatalf("飞书长连接崩溃: %v", err)
+	}
 }
