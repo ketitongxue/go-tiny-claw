@@ -28,9 +28,11 @@ type FeishuBot struct {
 	appSecret string
 	workDir   string
 	engine    *engine.AgentEngine // 持有核心引擎引用
+	sess      *ctxpkg.Session     // 新增session信息
+	r         *FeishuReporter     // 新增实现Reporter接口的FeishuReporter实例
 }
 
-func NewFeishuBot(eng *engine.AgentEngine) *FeishuBot {
+func NewFeishuBot(eng *engine.AgentEngine, sess *ctxpkg.Session) *FeishuBot {
 	appID := os.Getenv("FEISHU_APP_ID")
 	appSecret := os.Getenv("FEISHU_APP_SECRET")
 
@@ -58,6 +60,7 @@ func NewFeishuBot(eng *engine.AgentEngine) *FeishuBot {
 		appSecret: appSecret,
 		workDir:   workDir,
 		engine:    eng,
+		sess:      sess, // 绑定session信息
 	}
 }
 
@@ -75,8 +78,27 @@ func (b *FeishuBot) GetEventDispatcher() *dispatcher.EventDispatcher {
 			chatId := *event.Event.Message.ChatId
 			log.Printf("[Feishu] 收到会话 %s 消息: %s\n", chatId, contentStr)
 
+			// 【新增】：拦截人工审批的特殊口令
+			if strings.HasPrefix(contentStr, "approve ") {
+				taskID := strings.TrimPrefix(contentStr, "approve ")
+				taskID = strings.TrimSpace(taskID)
+				// 唤醒挂起的引擎协程！
+				GlobalApprovalMgr.ResolveApproval(taskID, true, "人类管理员已批准操作")
+				log.Printf("[Feishu] 会话 %s: ✅ 已为您批准任务 %s", chatId, taskID)
+				return nil
+			}
+			if strings.HasPrefix(contentStr, "reject ") {
+				taskID := strings.TrimPrefix(contentStr, "reject ")
+				taskID = strings.TrimSpace(taskID)
+				// 唤醒挂起的引擎协程，并反馈拒绝理由！
+				GlobalApprovalMgr.ResolveApproval(taskID, false, "人类管理员认为该操作存在极高风险，已无情拒绝")
+				log.Printf("[Feishu] 会话 %s: 🚫 已拒绝任务 %s", chatId, taskID)
+				return nil
+			}
+
 			// 【驾驭并发】：收到消息后，绝不能阻塞长连接事件回调。
 			// 我们要为每个请求开启一个独立的 Goroutine 跑 Agent 任务！
+			// 如果不是审批命令，则是正常对话，启动一个新的 Agent 任务去处理
 			go b.handleAgentRun(chatId, contentStr)
 
 			return nil
@@ -87,6 +109,11 @@ func (b *FeishuBot) GetEventDispatcher() *dispatcher.EventDispatcher {
 		})
 
 	return handler
+}
+
+// 新增一个方法，返回FeishuBot绑定的Reporter
+func (b *FeishuBot) Reporter() *FeishuReporter {
+	return b.r
 }
 
 // StartLongConnection 启动飞书事件长连接。
@@ -116,6 +143,8 @@ func (b *FeishuBot) handleAgentRun(chatId string, prompt string) {
 		client: b.client,
 		chatId: chatId,
 	}
+	b.r = reporter
+	b.sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt}) // 将prompt加入会话中
 
 	// 启动引擎！
 	err := b.engine.Run(context.Background(), session, reporter)
