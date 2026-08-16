@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
+	"github.com/ketitongxue/go-tiny-claw/internal/observability"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 	"github.com/ketitongxue/go-tiny-claw/internal/tools"
@@ -43,16 +44,36 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter Reporter) error {
 	log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s\n", session.ID, session.WorkDir)
 
+	// 【埋点 1】：开启 Root Span，记录整个任务的生命周期
+	ctx, rootSpan := observability.StartSpan(ctx, "Agent.Run")
+	rootSpan.AddAttribute("SessionID", session.ID)
+	rootSpan.AddAttribute("WorkDir", session.WorkDir)
+
+	// defer 保证在引擎退出时，无论成功失败，都能结束根 Span 并导出 Trace 报告
+	defer func() {
+		rootSpan.EndSpan()
+		_ = observability.ExportTraceToFile(rootSpan, session.WorkDir, session.ID)
+		log.Printf("📊 [Tracing] 本次任务的执行回放链路已保存至工作区的 .claw/traces 目录下\n")
+	}()
+
 	// 根据当前 Session 的工作区，动态组装最新的 System Prompt
 	composer := ctxpkg.NewPromptComposer(session.WorkDir, e.PlanMode)
 	systemMsg := composer.Build()
 
+	turnCount := 0
+
 	for {
+		turnCount++
+
+		// 【埋点 2】：记录单次 Turn 循环
+		turnCtx, turnSpan := observability.StartSpan(ctx, fmt.Sprintf("Turn-%d", turnCount))
+		defer turnSpan.EndSpan() // 利用 defer，哪怕遇到了 break 或 error 也会计算耗时
+
 		availableTools := e.registry.GetAvailableTools()
 
 		// 1. 【上下文组装】: System Prompt + 截取最近的 6 条消息作为 Working Memory
 		// 在实际业务中，由于工具返回结果可能很长，短期工作记忆往往设为 6-10 条足以维系连贯对话
-		workingMemory := session.GetWorkingMemory(6)
+		workingMemory := session.GetWorkingMemory(20)
 
 		var contextHistory []schema.Message
 		contextHistory = append(contextHistory, systemMsg)
@@ -61,6 +82,9 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		// 2. 【核心注入点】: 在向 Provider 发起推理前，过一遍内存压缩器！
 		// 无论你带出了多少上下文，如果字符总数超标，早期日志将被掩码化，超大日志将被掐头去尾
 		compactedContext := e.compactor.Compact(contextHistory)
+
+		// 记录发给模型的实际上下文大小，非常有助于排查幻觉
+		turnSpan.AddAttribute("context_message_count", len(compactedContext))
 
 		var currentTurnThinkingContent string
 
@@ -71,7 +95,12 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 				reporter.OnThinking(ctx)
 			}
 
-			thinkResp, err := e.provider.Generate(ctx, compactedContext, nil)
+			// 【埋点 3】：记录 Thinking 调用
+			thinkCtx, thinkSpan := observability.StartSpan(turnCtx, "LLM.Thinking")
+
+			thinkResp, err := e.provider.Generate(thinkCtx, compactedContext, nil)
+			thinkSpan.EndSpan() // 结束思考跨度
+
 			if err != nil {
 				return fmt.Errorf("Thinking 阶段失败: %w", err)
 			}
@@ -82,7 +111,11 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		}
 
 		// ================= Phase 2: Action =================
-		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
+		// 【埋点 4】：记录 Action 调用
+		actCtx, actSpan := observability.StartSpan(turnCtx, "LLM.Action")
+		actionResp, err := e.provider.Generate(actCtx, compactedContext, availableTools)
+		actSpan.EndSpan() // 结束行动跨度
+
 		if err != nil {
 			return fmt.Errorf("Action 阶段失败: %w", err)
 		}
@@ -103,6 +136,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 
 		if len(actionResp.ToolCalls) == 0 {
 			// 如果没有工具调用，说明本次任务已完成，打破 ReAct 循环，挂起等待人类的下一条指令
+			turnSpan.EndSpan() // 没有工具调用，正常结束
 			break
 		}
 
@@ -125,7 +159,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 					reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
 				}
 
-				result := e.registry.Execute(ctx, call)
+				result := e.registry.Execute(turnCtx, call)
 
 				// 【核心拦截与注入】
 				finalOutput := result.Output
@@ -147,7 +181,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 
 				observationMsgs[idx] = schema.Message{
 					Role:       schema.RoleUser,
-					Content:    result.Output,
+					Content:    result.Output, // 生产环境为了 json 不至于过大，可考虑此处不塞入全量 Output
 					ToolCallID: call.ID,
 				}
 
@@ -163,6 +197,9 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 
 		// 1. 先将所有的工具执行结果（Observation）持久化到 Session 中，开启下一轮的复盘与推理
 		session.Append(observationMsgs...)
+
+		// 结束本轮 Turn 的 Span
+		turnSpan.EndSpan()
 
 		// 2. 【核心防线】：在准备进入下一轮之前，进行死循环探测！
 		reminderMsg := e.injector.CheckAndInject(lastToolCall, lastToolResult)
