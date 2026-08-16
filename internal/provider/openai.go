@@ -135,6 +135,14 @@ func (p *OpenAIProvider) Generate(ctx context.Context, msgs []schema.Message, av
 		Content: choice.Content,
 	}
 
+	// 【新增】提取 Usage 信息
+	if resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0 {
+		resultMsg.Usage = &schema.Usage{
+			PromptTokens:     int(resp.Usage.PromptTokens),
+			CompletionTokens: int(resp.Usage.CompletionTokens),
+		}
+	}
+
 	for _, tc := range choice.ToolCalls {
 		if tc.Type == "function" {
 			resultMsg.ToolCalls = append(resultMsg.ToolCalls, schema.ToolCall{
