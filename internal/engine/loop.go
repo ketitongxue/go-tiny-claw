@@ -52,8 +52,11 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	// defer 保证在引擎退出时，无论成功失败，都能结束根 Span 并导出 Trace 报告
 	defer func() {
 		rootSpan.EndSpan()
-		_ = observability.ExportTraceToFile(rootSpan, session.WorkDir, session.ID)
-		log.Printf("📊 [Tracing] 本次任务的执行回放链路已保存至工作区的 .claw/traces 目录下\n")
+		if err := observability.ExportTraceToFile(rootSpan, session.WorkDir, session.ID); err != nil {
+			log.Printf("[Tracing] 保存执行链路失败: %v", err)
+		} else {
+			log.Printf("📊 [Tracing] 本次任务的执行回放链路已保存至工作区的 .claw/traces 目录下\n")
+		}
 	}()
 
 	// 根据当前 Session 的工作区，动态组装最新的 System Prompt
@@ -63,6 +66,9 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	turnCount := 0
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		turnCount++
 
 		// 【埋点 2】：记录单次 Turn 循环
@@ -181,7 +187,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 
 				observationMsgs[idx] = schema.Message{
 					Role:       schema.RoleUser,
-					Content:    result.Output, // 生产环境为了 json 不至于过大，可考虑此处不塞入全量 Output
+					Content:    finalOutput,
 					ToolCallID: call.ID,
 				}
 
@@ -241,6 +247,9 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 	turnCount := 0
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		turnCount++
 		if turnCount > maxSubTurns {
 			return "", fmt.Errorf("子智能体探索过于深入，超过 %d 轮被强制召回，请主 Agent 给它更明确的指令", maxSubTurns)

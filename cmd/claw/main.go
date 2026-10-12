@@ -2,132 +2,173 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
+	"github.com/ketitongxue/go-tiny-claw/internal/feishu"
 	"github.com/ketitongxue/go-tiny-claw/internal/observability"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 	"github.com/ketitongxue/go-tiny-claw/internal/tools"
 )
 
-func main() {
-	// 确保已设置 ZHIPU_API_KEY
-	if os.Getenv("ZHIPU_API_KEY") == "" {
-		log.Fatal("请先导出 ZHIPU_API_KEY 环境变量")
+const demoPrompt = `为了加快执行速度，请你在一轮回复中，【同时并行】完成以下两件事：
+1. 使用 bash 工具执行 'sleep 2 && echo "系统环境检查完毕"'
+2. 使用 write_file 工具，在当前目录下创建一个 'trace_test.md'，内容写上 "测试并发的写入"。
+请确保你是分别调用两个不同的工具，不要试图把它们合并成一个命令！`
+
+type options struct {
+	mode, workDir, model, prompt string
+	thinking, plan, checkConfig  bool
+}
+
+func parseOptions(args []string, output io.Writer) (options, error) {
+	var opts options
+	fs := flag.NewFlagSet("claw", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.StringVar(&opts.mode, "mode", "feishu", "运行模式：feishu（长连接）或 demo（原终端演示）")
+	fs.StringVar(&opts.workDir, "workdir", "workspace", "工具、会话、技能和 Trace 共用的工作区")
+	fs.StringVar(&opts.model, "model", "glm-5.2", "智谱模型名称")
+	fs.StringVar(&opts.prompt, "prompt", demoPrompt, "demo 模式下执行的指令")
+	fs.BoolVar(&opts.thinking, "thinking", false, "开启独立思考阶段")
+	fs.BoolVar(&opts.plan, "plan", false, "开启 PLAN.md / TODO.md 任务续接")
+	fs.BoolVar(&opts.checkConfig, "check-config", false, "仅检查本地启动配置，不连接服务、不调用模型")
+	if err := fs.Parse(args); err != nil {
+		return opts, err
+	}
+	if fs.NArg() != 0 {
+		return opts, fmt.Errorf("不支持位置参数，请通过 -prompt 指定 demo 指令")
+	}
+	if opts.mode != "feishu" && opts.mode != "demo" {
+		return opts, fmt.Errorf("未知运行模式 %q，可选 feishu 或 demo", opts.mode)
+	}
+	if strings.TrimSpace(opts.workDir) == "" || strings.TrimSpace(opts.model) == "" {
+		return opts, fmt.Errorf("workdir 和 model 不能为空")
+	}
+	if opts.mode == "demo" && strings.TrimSpace(opts.prompt) == "" {
+		return opts, fmt.Errorf("demo 指令不能为空")
+	}
+	workDir, err := filepath.Abs(opts.workDir)
+	if err != nil {
+		return opts, fmt.Errorf("解析工作区失败: %w", err)
+	}
+	opts.workDir = workDir
+	return opts, nil
+}
+
+func validateEnvironment(mode string, getenv func(string) string) error {
+	required := []string{"ZHIPU_API_KEY"}
+	if mode == "feishu" {
+		required = append(required, "FEISHU_APP_ID", "FEISHU_APP_SECRET")
+	}
+	var missing []string
+	for _, key := range required {
+		if strings.TrimSpace(getenv(key)) == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("缺少环境变量: %s；请在本机设置后重新启动（参见 README.md）", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// 每个聊天分别装配引擎、计费器和审批闭包，避免上下文、失败计数与账单串线。
+func newSessionEngine(p provider.LLMProvider, sess *ctxpkg.Session, reporter engine.Reporter, opts options) *engine.AgentEngine {
+	registry := tools.NewRegistry()
+	registry.Register(tools.NewReadFileTool(sess.WorkDir))
+	registry.Register(tools.NewWriteFileTool(sess.WorkDir))
+	registry.Register(tools.NewBashTool(sess.WorkDir))
+	registry.Register(tools.NewEditFileTool(sess.WorkDir))
+
+	explorerRegistry := tools.NewRegistry()
+	explorerRegistry.Register(tools.NewReadFileTool(sess.WorkDir))
+	explorerRegistry.Register(tools.NewBashTool(sess.WorkDir))
+
+	if opts.mode == "feishu" {
+		middleware := func(ctx context.Context, call schema.ToolCall) (bool, string) {
+			if !feishu.IsDangerousCommand(call.Name, string(call.Arguments)) {
+				return true, ""
+			}
+			r, ok := reporter.(*feishu.FeishuReporter)
+			if !ok || r == nil {
+				return false, "飞书审批通道不可用"
+			}
+			return feishu.GlobalApprovalMgr.WaitForApprovalContext(ctx, r.ChatID(), call.ID, call.Name, string(call.Arguments), r)
+		}
+		registry.Use(middleware)
+		explorerRegistry.Use(middleware)
 	}
 
-	// 1. 获取当前执行目录作为 WorkDir 物理边界
-	workDir, _ := os.Getwd()
-	workDir += "/workspace"
-	modelName := "glm-5.2"
+	tracked := observability.NewCostTracker(p, opts.model, sess)
+	eng := engine.NewAgentEngine(tracked, registry, opts.thinking, opts.plan)
+	registry.Register(tools.NewSubagentTool(eng, explorerRegistry, reporter))
+	return eng
+}
 
-	// 2. 初始化真实的 Provider大脑 (指向智谱 GLM-5.2)
-	// 这里你可以任意切换 NewZhipuClaudeProvider 或 NewZhipuOpenAIProvider，效果完全一致！
-	llmProvider := provider.NewZhipuOpenAIProvider(modelName)
+func run(ctx context.Context, args []string, output io.Writer) error {
+	opts, err := parseOptions(args, output)
+	if err != nil {
+		return err
+	}
+	if err := validateEnvironment(opts.mode, os.Getenv); err != nil {
+		return err
+	}
+	if info, err := os.Stat(opts.workDir); err == nil && !info.IsDir() {
+		return fmt.Errorf("工作区不是目录: %s", opts.workDir)
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("检查工作区失败: %w", err)
+	}
+	if opts.checkConfig {
+		fmt.Fprintf(output, "本地配置检查通过：mode=%s model=%s workspace=%s\n尚未验证凭证有效性、网络连接或飞书收发消息。\n", opts.mode, opts.model, opts.workDir)
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(opts.workDir, 0o755); err != nil {
+		return fmt.Errorf("创建工作区失败: %w", err)
+	}
+	p := provider.NewZhipuOpenAIProvider(opts.model)
+	if opts.mode == "feishu" {
+		bot, err := feishu.NewFeishuBotWithFactory(opts.workDir, func(sess *ctxpkg.Session, reporter engine.Reporter) *engine.AgentEngine {
+			return newSessionEngine(p, sess, reporter, opts)
+		})
+		if err != nil {
+			return err
+		}
+		log.Printf("启动飞书事件长连接，工作区: %s，模型: %s", opts.workDir, opts.model)
+		return bot.StartLongConnection(ctx)
+	}
 
 	reporter := engine.NewTerminalReporter()
-
-	// 3. 初始化真实的 Tool Registry
-	registry := tools.NewRegistry()
-
-	// 4. 将真实的 ReadFile 工具挂载到注册表中
-	registry.Register(tools.NewReadFileTool(workDir))
-	registry.Register(tools.NewWriteFileTool(workDir))
-	registry.Register(tools.NewBashTool(workDir))
-	registry.Register(tools.NewEditFileTool(workDir))
-
-	// 【防御沙箱】为子智能体准备受限的只读注册表
-	// readOnlyRegistry := tools.NewRegistry()
-	// readOnlyRegistry.Register(tools.NewReadFileTool(workDir))
-	// readOnlyRegistry.Register(tools.NewBashTool(workDir)) // 允许简单的 grep 等搜索操作
-
-	// 为主智能体准备全功能注册表
-	// mainRegistry := tools.NewRegistry()
-	// mainRegistry.Register(tools.NewReadFileTool(workDir))
-	// mainRegistry.Register(tools.NewWriteFileTool(workDir))
-	// mainRegistry.Register(tools.NewBashTool(workDir))
-	// mainRegistry.Register(tools.NewEditFileTool(workDir))
-
-	// 5. 实例化核心引擎，由于任务简单，我们关闭思考阶段 (EnableThinking = false) 以加快速度
-	// eng := engine.NewAgentEngine(llmProvider, mainRegistry, false, false)
-	// 【注入新实现的终端输出器】
-	// reporter := engine.NewTerminalReporter()
-
-	// 【核心装配】：将带有 Engine 引用和只读 Registry 的 Subagent 工具注册进主线
-	// mainRegistry.Register(tools.NewSubagentTool(eng, readOnlyRegistry, reporter))
-
-	// 我们使用一个固定的 SessionID，以便在多次运行之间共享基于内存的“短期工作记忆”。
-	// (在真实的 CLI 中，如果进程重启，Session 的内存历史其实是丢失的。
-	// 但这正是我们要演示的重点：即便短期内存丢失，只要 TODO.md 还在，任务就能继续！)
-	sessionID := "test_trace_001"
-	sess := ctxpkg.GlobalSessionMgr.GetOrCreate(sessionID, workDir)
-	// sess.Append(schema.Message{Role: schema.RoleUser, Content: ""})
-
-	// 2. 核心拼装：用 Tracker 将真实的大脑包裹起来
-	trackedProvider := observability.NewCostTracker(llmProvider, modelName, sess)
-
-	prompt := `
-    为了加快执行速度，请你在一轮回复中，【同时并行】完成以下两件事：
-    1. 使用 bash 工具执行 'sleep 2 && echo "系统环境检查完毕"'
-    2. 使用 write_file 工具，在当前目录下创建一个 'trace_test.md'，内容写上 "测试并发的写入"。
-    请确保你是分别调用两个不同的工具，不要试图把它们合并成一个命令！
-	`
-
-	// 3. 将被包裹的 Provider 注入给 Engine (Engine 毫不知情)
-	eng := engine.NewAgentEngine(trackedProvider, registry, false, false)
-
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
-
-	log.Println("\n>>> 🚀 启动带 Tracing 链路追踪的测试...")
-	err := eng.Run(context.Background(), sess, reporter)
-	if err != nil {
-		log.Fatalf("引擎运行崩溃: %v", err)
+	sess := ctxpkg.NewSession("test_trace_001", opts.workDir)
+	eng := newSessionEngine(p, sess, reporter, opts)
+	sess.Append(schema.Message{Role: schema.RoleUser, Content: opts.prompt})
+	log.Println("启动终端演示（含工具、子智能体、费用统计和 Tracing）")
+	if err := eng.Run(ctx, sess, reporter); err != nil {
+		return err
 	}
+	input, completion, cost := sess.UsageTotals()
+	log.Printf("会话 %s | Input Tokens: %d | Output Tokens: %d | 估算费用 (CNY): ¥%.6f", sess.ID, input, completion, cost)
+	return nil
+}
 
-	log.Printf("\n================ 财务报表 ================\n")
-	log.Printf("会话 ID: %s\n", sess.ID)
-	log.Printf("总消耗 Input Tokens: %d\n", sess.TotalPromptTokens)
-	log.Printf("总消耗 Output Tokens: %d\n", sess.TotalCompletionTokens)
-	log.Printf("总计费用 (CNY): ¥%.6f\n", sess.TotalCostCNY)
-	log.Printf("==========================================\n")
-
-	// log.Println("\n>>> 🚀 启动多智能体协同测试...")
-	// sess.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
-
-	// err := eng.Run(context.Background(), sess, reporter)
-	// if err != nil {
-	// 	log.Fatalf("引擎运行崩溃: %v", err)
-	// }
-
-	// 6. 初始化飞书 Bot，并通过长连接接收事件
-	// bot := feishu.NewFeishuBot(eng, sess)
-
-	// 【核心注入】注册安全拦截 Middleware
-	// registry.Use(func(ctx context.Context, call schema.ToolCall) (bool, string) {
-	// 	argsStr := string(call.Arguments)
-
-	// 	// 检查是否命中高危特征库
-	// 	if feishu.IsDangerousCommand(call.Name, argsStr) {
-	// 		taskID := call.ID // 使用大模型生成的唯一 ToolCallID 作为 TaskID
-
-	// 		// 挂起当前协程，发送消息给飞书，死死等待人类的审批！
-	// 		allowed, reason := feishu.GlobalApprovalMgr.WaitForApproval(taskID, call.Name, argsStr, bot.Reporter())
-
-	// 		if !allowed {
-	// 			return false, reason // 拒绝，将理由传回给大模型
-	// 		}
-	// 		return true, "" // 同意，放行底层工具
-	// 	}
-
-	// 	// 没命中黑名单，直接 YOLO 放行
-	// 	return true, ""
-	// })
-
-	// log.Println("🚀 go-tiny-claw 正在启动飞书事件长连接")
-	// if err := bot.StartLongConnection(context.Background()); err != nil {
-	// 	log.Fatalf("飞书长连接崩溃: %v", err)
-	// }
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdout); err != nil && !errors.Is(err, flag.ErrHelp) && !errors.Is(err, context.Canceled) {
+		log.Printf("启动或运行失败: %v", err)
+		os.Exit(1)
+	}
 }

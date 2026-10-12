@@ -1,73 +1,95 @@
 package context
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 )
 
-func TestGetWorkingMemoryPreservesConversationStart(t *testing.T) {
-	session := NewSession("test", t.TempDir())
-	session.Append(
-		schema.Message{Role: schema.RoleUser, Content: "搭建项目"},
-		schema.Message{
-			Role: schema.RoleAssistant,
-			ToolCalls: []schema.ToolCall{{
-				ID:        "call-1",
-				Name:      "bash",
-				Arguments: []byte(`{"command":"ls"}`),
-			}},
-		},
-		schema.Message{Role: schema.RoleUser, Content: "第一轮结果", ToolCallID: "call-1"},
-		schema.Message{
-			Role: schema.RoleAssistant,
-			ToolCalls: []schema.ToolCall{{
-				ID:        "call-2",
-				Name:      "read_file",
-				Arguments: []byte(`{"path":"main.go"}`),
-			}},
-		},
-		schema.Message{Role: schema.RoleUser, Content: "第二轮结果", ToolCallID: "call-2"},
-		schema.Message{
-			Role: schema.RoleAssistant,
-			ToolCalls: []schema.ToolCall{{
-				ID:        "call-3",
-				Name:      "bash",
-				Arguments: []byte(`{"command":"go test ./..."}`),
-			}},
-		},
-		schema.Message{Role: schema.RoleUser, Content: "第三轮结果", ToolCallID: "call-3"},
+func TestWorkingMemoryKeepsCompleteParallelToolTurn(t *testing.T) {
+	s := NewSession("chat", t.TempDir())
+	s.Append(
+		schema.Message{Role: schema.RoleUser, Content: "old task"},
+		schema.Message{Role: schema.RoleAssistant, Content: "old answer"},
+		schema.Message{Role: schema.RoleUser, Content: "inspect"},
+		schema.Message{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: "a", Name: "read_file"}, {ID: "b", Name: "read_file"}}},
+		schema.Message{Role: schema.RoleUser, ToolCallID: "a", Content: "file a"},
+		schema.Message{Role: schema.RoleUser, ToolCallID: "b", Content: "file b"},
+		schema.Message{Role: schema.RoleAssistant, Content: "answer"},
 	)
-
-	// 最近 6 条会从第一条 assistant 消息开始，必须回溯补回初始 User 消息。
-	got := session.GetWorkingMemory(6)
-	if len(got) != 7 {
-		t.Fatalf("expected the complete conversation turn, got %d messages", len(got))
-	}
-	if got[0].Role != schema.RoleUser || got[0].ToolCallID != "" {
-		t.Fatalf("working memory must start with a normal user message, got %#v", got[0])
-	}
-
-	for i, msg := range got {
-		if msg.Role == schema.RoleUser && msg.ToolCallID != "" {
-			if i == 0 || got[i-1].Role != schema.RoleAssistant || len(got[i-1].ToolCalls) == 0 {
-				t.Fatalf("tool result at index %d has no preceding assistant tool call", i)
-			}
+	for _, limit := range []int{1, 2, 3, 4, 5} {
+		msgs := s.GetWorkingMemory(limit)
+		if len(msgs) != 5 || msgs[0].Content != "inspect" || len(msgs[1].ToolCalls) != 2 || msgs[2].ToolCallID != "a" || msgs[3].ToolCallID != "b" {
+			t.Fatalf("limit %d produced broken tool history: %+v", limit, msgs)
 		}
+	}
+	msgs := s.GetWorkingMemory(2)
+	msgs[0].Content = "modified by caller"
+	if s.GetWorkingMemory(2)[0].Content != "inspect" {
+		t.Fatal("working memory aliases the session history slice")
+	}
+	if len(s.GetWorkingMemory(0)) != 7 {
+		t.Fatal("unlimited working memory lost history")
 	}
 }
 
-func TestGetWorkingMemoryStartsAtLatestUserTurn(t *testing.T) {
-	session := NewSession("test", t.TempDir())
-	session.Append(
-		schema.Message{Role: schema.RoleUser, Content: "旧任务"},
-		schema.Message{Role: schema.RoleAssistant, Content: "旧回复"},
-		schema.Message{Role: schema.RoleUser, Content: "新任务"},
-		schema.Message{Role: schema.RoleAssistant, Content: "新回复"},
-	)
+func TestCompactionPreservesToolReferencesAndLatestEvidence(t *testing.T) {
+	oldOutput := strings.Repeat("old log ", 200)
+	latestOutput := "HEADER" + strings.Repeat("middle", 500) + "TRAILER"
+	msgs := []schema.Message{
+		{Role: schema.RoleSystem, Content: "system instructions"},
+		{Role: schema.RoleUser, Content: "user request"},
+		{Role: schema.RoleAssistant, Content: strings.Repeat("thinking", 100), ToolCalls: []schema.ToolCall{{ID: "old", Name: "read_file", Arguments: json.RawMessage(`{"path":"old"}`)}}},
+		{Role: schema.RoleUser, ToolCallID: "old", Content: oldOutput},
+		{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: "latest", Name: "read_file", Arguments: json.RawMessage(`{"path":"latest"}`)}}},
+		{Role: schema.RoleUser, ToolCallID: "latest", Content: latestOutput},
+	}
+	got := NewCompactor(500, 2).Compact(msgs)
+	if len(got) != len(msgs) || got[0].Content != msgs[0].Content || got[1].Content != msgs[1].Content {
+		t.Fatalf("compaction altered message structure or instructions: %+v", got)
+	}
+	for i := range msgs {
+		if got[i].Role != msgs[i].Role || got[i].ToolCallID != msgs[i].ToolCallID || !reflect.DeepEqual(got[i].ToolCalls, msgs[i].ToolCalls) {
+			t.Fatalf("compaction broke tool linkage at message %d", i)
+		}
+	}
+	if len(got[3].Content) >= len(oldOutput) || !strings.HasPrefix(got[5].Content, "HEADER") || !strings.HasSuffix(got[5].Content, "TRAILER") || len(got[5].Content) >= len(latestOutput) {
+		t.Fatal("compaction did not reduce logs while preserving recent head/tail evidence")
+	}
+	if msgs[3].Content != oldOutput || msgs[5].Content != latestOutput {
+		t.Fatal("compaction mutated durable session history")
+	}
+}
 
-	got := session.GetWorkingMemory(2)
-	if len(got) != 2 || got[0].Content != "新任务" || got[1].Content != "新回复" {
-		t.Fatalf("expected the latest complete user turn, got %#v", got)
+func TestPromptComposerRetainsWorkspaceInstructionsSkillsAndPlanMode(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("workspace-specific instruction"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	skillDir := filepath.Join(dir, ".claw", "skills", "verify")
+	if err := os.MkdirAll(skillDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: verify\ndescription: verification tasks\n---\nUse the workspace verification procedure."), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, plan := range []bool{false, true} {
+		msg := NewPromptComposer(dir, plan).Build()
+		if msg.Role != schema.RoleSystem {
+			t.Fatal("composer did not create a system prompt")
+		}
+		for _, expected := range []string{"workspace-specific instruction", "verification tasks", "Use the workspace verification procedure."} {
+			if !strings.Contains(msg.Content, expected) {
+				t.Errorf("missing %q from prompt", expected)
+			}
+		}
+		if strings.Contains(msg.Content, "Plan Mode: ON") != plan {
+			t.Errorf("plan mode not reflected in prompt: %v", plan)
+		}
 	}
 }

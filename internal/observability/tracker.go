@@ -72,7 +72,8 @@ func (t *CostTracker) Generate(ctx context.Context, msgs []schema.Message, avail
 		// 6. 将账单累加到当前的 Session 中，供人类后续随时查询
 		if t.session != nil {
 			t.session.RecordUsage(promptTokens, completionTokens, cost)
-			log.Printf("[Tracker] 💰 当前会话 (%s) 累计花费: ¥%.6f\n", t.session.ID, t.session.TotalCostCNY)
+			_, _, totalCost := t.session.UsageTotals()
+			log.Printf("[Tracker] 💰 当前会话 (%s) 累计花费: ¥%.6f\n", t.session.ID, totalCost)
 		}
 	} else {
 		log.Printf("[Tracker] ⚠️ API 调用完成，但未返回 Usage 数据 | 耗时: %v\n", latency)

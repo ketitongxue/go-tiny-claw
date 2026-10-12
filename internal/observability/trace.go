@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,9 +63,9 @@ func (s *Span) AddAttribute(key string, value interface{}) {
 // ExportTraceToFile 当整个根 Span 结束时，将其序列化并保存为本地 JSON 文件
 func ExportTraceToFile(rootSpan *Span, workDir string, sessionID string) error {
 	traceDir := filepath.Join(workDir, ".claw", "traces")
-	os.MkdirAll(traceDir, 0755)
-
-	filename := filepath.Join(traceDir, fmt.Sprintf("trace_%s_%d.json", sessionID, time.Now().Unix()))
+	if err := os.MkdirAll(traceDir, 0755); err != nil {
+		return err
+	}
 
 	// 美化输出 JSON，便于人类和工具阅读
 	data, err := json.MarshalIndent(rootSpan, "", "  ")
@@ -72,5 +73,30 @@ func ExportTraceToFile(rootSpan *Span, workDir string, sessionID string) error {
 		return err
 	}
 
-	return os.WriteFile(filename, data, 0644)
+	// Sessions can finish more than once per second. Create each file atomically
+	// with a unique suffix, and keep arbitrary session IDs out of path syntax.
+	safeID := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, sessionID)
+	if len(safeID) > 80 {
+		safeID = safeID[:80]
+	}
+	file, err := os.CreateTemp(traceDir, fmt.Sprintf("trace_%s_*.json", safeID))
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(data)
+	closeErr := file.Close()
+	if writeErr != nil {
+		_ = os.Remove(file.Name())
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(file.Name())
+		return closeErr
+	}
+	return nil
 }

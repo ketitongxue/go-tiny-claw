@@ -33,6 +33,13 @@ func (s *Session) RecordUsage(prompt int, completion int, cost float64) {
 	s.TotalCostCNY += cost
 }
 
+// UsageTotals returns a consistent snapshot while parallel subagents record usage.
+func (s *Session) UsageTotals() (prompt int, completion int, cost float64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.TotalPromptTokens, s.TotalCompletionTokens, s.TotalCostCNY
+}
+
 func NewSession(id string, workDir string) *Session {
 	return &Session{
 		ID:        id,
