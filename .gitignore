@@ -1,0 +1,21 @@
+# macOS metadata
+.DS_Store
+
+# Local credentials (keep example configuration files trackable)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Go binaries and test/build output
+/claw
+/bench
+/bin/
+/dist/
+*.test
+*.out
+
+# Generated Agent workspace and runtime state
+/workspace/
+**/.claw/traces/
+**/.claw/sessions/

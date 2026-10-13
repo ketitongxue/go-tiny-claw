@@ -180,6 +180,7 @@ go-tiny-claw/
 │   ├── schema/
 │   └── tools/
 │
+├── .gitignore
 ├── Dockerfile.sandbox
 ├── go.mod
 ├── go.sum
@@ -221,11 +222,38 @@ docker version
 ## 1. 获取代码
 
 ```bash
+mkdir -p ~/Documents
+cd ~/Documents
 git clone https://github.com/ketitongxue/go-tiny-claw.git
 cd go-tiny-claw
 
 go mod download
 ```
+
+### Git 更新与推送
+
+建议将项目放在 `~/Documents/go-tiny-claw`（macOS 文稿目录）下，项目根目录是独立 Git 仓库，`main` 分支跟踪 `origin/main`。
+
+开始修改前同步远端：
+
+```bash
+cd ~/Documents/go-tiny-claw
+git pull --ff-only
+```
+
+修改完成后提交并推送：
+
+```bash
+git status
+go test ./...
+git add .
+git commit -m "说明本次修改"
+git push
+```
+
+远端地址为 `https://github.com/ketitongxue/go-tiny-claw.git`，可通过 `git remote -v` 查看。HTTPS 推送需要仓库写入权限和有效认证；使用 GitHub CLI 时，可通过 `gh auth login` 登录，使用 `gh auth setup-git` 配置 Git 认证，不要把 Token 或 API Key 写入代码。
+
+`.gitignore` 排除了本地二进制、构建/测试产物、`.DS_Store`、`.env` 密钥文件、`workspace/` 以及 `.claw/traces/`、`.claw/sessions/` 运行数据。示例环境配置和 `.claw/skills/` 仍可提交。已有本地文件会保留，但不会随 `git add .` 上传。
 
 ---
 
