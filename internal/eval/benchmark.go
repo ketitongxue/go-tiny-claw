@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"time"
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
+	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 	"github.com/ketitongxue/go-tiny-claw/internal/observability"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
@@ -37,10 +37,11 @@ type TestResult struct {
 
 type BenchmarkRunner struct {
 	modelName string
+	executor  executor.Executor
 }
 
-func NewBenchmarkRunner(model string) *BenchmarkRunner {
-	return &BenchmarkRunner{modelName: model}
+func NewBenchmarkRunner(model string, exec executor.Executor) *BenchmarkRunner {
+	return &BenchmarkRunner{modelName: model, executor: exec}
 }
 
 // RunSuite 执行一组评测集，并返回跑分报告
@@ -78,17 +79,24 @@ func (b *BenchmarkRunner) RunSuite(ctx context.Context, testcases []TestCase) {
 func (b *BenchmarkRunner) runSingleTest(ctx context.Context, tc TestCase) TestResult {
 	startTime := time.Now()
 
-	// 1. 为每个用例创建一个绝对干净的沙箱目录 (物理隔离)
-	workDir, _ := os.Getwd()
-	workDir += fmt.Sprintf("/workspace/%s_%d", tc.ID, time.Now().Unix())
-	_ = os.MkdirAll(workDir, 0755)
+	if b.executor == nil {
+		return TestResult{TestCaseID: tc.ID, ErrorMsg: "Benchmark Executor 未配置"}
+	}
+	// Separate fixture directories are not sandboxes; the injected Executor
+	// provides the command isolation, including for generated-code validation.
+	workDir, err := os.Getwd()
+	if err != nil {
+		return TestResult{TestCaseID: tc.ID, ErrorMsg: err.Error()}
+	}
+	workDir += fmt.Sprintf("/workspace/%s_%d", tc.ID, time.Now().UnixNano())
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return TestResult{TestCaseID: tc.ID, ErrorMsg: err.Error()}
+	}
 
 	// 2. (可选) 执行 Setup 脚本准备靶机代码
 	if tc.SetupScript != "" {
-		cmd := exec.Command("bash", "-c", tc.SetupScript)
-		cmd.Dir = workDir
-		if err := cmd.Run(); err != nil {
-			return TestResult{TestCaseID: tc.ID, Passed: false, ErrorMsg: "靶机 Setup 失败"}
+		if _, err := b.runScript(ctx, workDir, tc.SetupScript); err != nil {
+			return TestResult{TestCaseID: tc.ID, Passed: false, ErrorMsg: fmt.Sprintf("靶机 Setup 失败: %v", err)}
 		}
 	}
 
@@ -100,7 +108,7 @@ func (b *BenchmarkRunner) runSingleTest(ctx context.Context, tc TestCase) TestRe
 	registry := tools.NewRegistry()
 	registry.Register(tools.NewReadFileTool(workDir))
 	registry.Register(tools.NewWriteFileTool(workDir))
-	registry.Register(tools.NewBashTool(workDir))
+	registry.Register(tools.NewBashTool(workDir, b.executor, executor.CodingPolicy()))
 	registry.Register(tools.NewEditFileTool(workDir))
 
 	eng := engine.NewAgentEngine(trackedProvider, registry, false, false)
@@ -108,16 +116,14 @@ func (b *BenchmarkRunner) runSingleTest(ctx context.Context, tc TestCase) TestRe
 	// 4. 让 Agent 开始干活
 	session.Append(schema.Message{Role: schema.RoleUser, Content: tc.TaskPrompt})
 	// 我们传入一个空的 reporter 屏蔽普通日志，防止刷屏
-	err := eng.Run(ctx, session, nil)
+	err = eng.Run(ctx, session, nil)
 
 	if err != nil {
 		return TestResult{TestCaseID: tc.ID, Passed: false, ErrorMsg: fmt.Sprintf("Agent 崩溃: %v", err)}
 	}
 
 	// 5. 【核心断言】Agent 跑完了，我们来验收成果！
-	cmd := exec.Command("bash", "-c", tc.ValidateScript)
-	cmd.Dir = workDir
-	out, err := cmd.CombinedOutput()
+	_, err = b.runScript(ctx, workDir, tc.ValidateScript)
 
 	duration := time.Since(startTime).Milliseconds()
 
@@ -127,7 +133,7 @@ func (b *BenchmarkRunner) runSingleTest(ctx context.Context, tc TestCase) TestRe
 			Passed:       false,
 			TotalCostCNY: session.TotalCostCNY,
 			DurationMs:   duration,
-			ErrorMsg:     fmt.Sprintf("验证脚本执行失败: %s", string(out)),
+			ErrorMsg:     fmt.Sprintf("验证脚本执行失败: %v", err),
 		}
 	}
 
@@ -137,4 +143,15 @@ func (b *BenchmarkRunner) runSingleTest(ctx context.Context, tc TestCase) TestRe
 		TotalCostCNY: session.TotalCostCNY,
 		DurationMs:   duration,
 	}
+}
+
+func (b *BenchmarkRunner) runScript(ctx context.Context, workDir, script string) (executor.Result, error) {
+	result, err := b.executor.Execute(ctx, executor.Request{Command: script, WorkDir: workDir, Timeout: executor.CodingPolicy().Timeout}, nil)
+	if err != nil {
+		return result, fmt.Errorf("%w\nSTDOUT:\n%s\nSTDERR:\n%s", err, result.Stdout, result.Stderr)
+	}
+	if result.ExitCode != 0 {
+		return result, fmt.Errorf("exit %d\nSTDOUT:\n%s\nSTDERR:\n%s", result.ExitCode, result.Stdout, result.Stderr)
+	}
+	return result, nil
 }

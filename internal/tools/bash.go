@@ -1,38 +1,40 @@
-// internal/tools/bash.go
 package tools
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os/exec"
-	"time"
+	"strings"
+	"unicode/utf8"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 )
 
+// BashTool owns argument parsing and model-facing output, not process startup.
 type BashTool struct {
-	workDir string // 工作区约束
+	workDir  string
+	executor executor.Executor
+	policy   executor.SandboxPolicy
 }
 
-func NewBashTool(workDir string) *BashTool {
-	return &BashTool{workDir: workDir}
+func NewBashTool(workDir string, exec executor.Executor, policy executor.SandboxPolicy) *BashTool {
+	return &BashTool{workDir: workDir, executor: exec, policy: policy}
 }
 
-func (t *BashTool) Name() string {
-	return "bash"
-}
+func (t *BashTool) Name() string { return "bash" }
 
 func (t *BashTool) Definition() schema.ToolDefinition {
 	return schema.ToolDefinition{
 		Name:        t.Name(),
-		Description: "在当前工作区执行任意的 bash 命令。支持链式命令(如 &&)。返回标准输出(stdout)和标准错误(stderr)。",
+		Description: "在配置的执行环境中运行 bash 命令。支持管道和链式命令（如 &&）。返回 stdout、stderr 和失败时的退出码；权限由执行环境决定。",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"command": map[string]interface{}{
 					"type":        "string",
-					"description": "要执行的 bash 命令，例如: ls -la 或 go test ./...",
+					"description": "要执行的 bash 命令，例如 ls -la 或 go test ./...",
 				},
 			},
 			"required": []string{"command"},
@@ -49,45 +51,74 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if err := json.Unmarshal(args, &input); err != nil {
 		return "", fmt.Errorf("参数解析失败: %w", err)
 	}
-
-	// 【驾驭底线 1】：Time Budgeting (时间预算与超时控制)
-	// 给予 bash 命令一个最大执行时间，防止大模型卡死进程 (比如运行了 top 或持续监听的 Web 服务)
-	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	// 在 macOS/Linux 下，我们通过将指令包裹在 `bash -c` 中执行，以支持环境变量、管道和逻辑与(&&)等复杂 Shell 语法。
-	cmd := exec.CommandContext(timeoutCtx, "bash", "-c", input.Command)
-
-	// 【驾驭底线 2】：绑定执行的工作区目录
-	// 确保命令默认在用户指定的 WorkDir 下执行，而不是引擎启动时的绝对路径。
-	cmd.Dir = t.workDir
-
-	// 执行并捕获 CombinedOutput (合并 stdout 和 stderr)
-	out, err := cmd.CombinedOutput()
-	outputStr := string(out)
-
-	// 如果命令执行超时，返回警告信息让模型知晓
-	if timeoutCtx.Err() == context.DeadlineExceeded {
-		return outputStr + "\n[警告: 命令执行超时(30s)，已被系统强制终止。如果是启动常驻服务，请尝试将其转入后台。]", nil
+	if strings.TrimSpace(input.Command) == "" {
+		return "", fmt.Errorf("command 不能为空")
 	}
-
-	// 【驾驭底线 3】：错误原样回传 (Self-Correction 自愈机制)
-	// 当 bash 报错时（err != nil），我们绝对不能返回 Go 的 error 阻断程序！
-	// 我们必须把 err 和 outputStr 拼接成字符串返回，利用大模型的自纠错能力自己分析报错！
+	if t.executor == nil {
+		return "", fmt.Errorf("Bash executor 未配置")
+	}
+	result, err := t.executor.Execute(ctx, executor.Request{
+		Command: input.Command,
+		WorkDir: t.workDir,
+		Timeout: t.policy.Timeout,
+	}, nil)
 	if err != nil {
-		return fmt.Sprintf("执行报错: %v\n输出:\n%s", err, outputStr), nil
+		status := fmt.Sprintf("执行基础设施错误: %v", err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = fmt.Sprintf("命令执行超时，已终止: %v", err)
+		} else if errors.Is(err, context.Canceled) {
+			status = fmt.Sprintf("命令执行已取消: %v", err)
+		}
+		return bashFailureOutput(status, result), err
 	}
-
-	// 如果没有终端输出（比如仅仅执行了 mkdir），给模型一个明确的执行成功的反馈
-	if outputStr == "" {
-		return "命令执行成功，无终端输出。", nil
+	if result.ExitCode != 0 {
+		err := fmt.Errorf("command exited with code %d", result.ExitCode)
+		return bashFailureOutput(fmt.Sprintf("Command exited with code %d", result.ExitCode), result), err
 	}
+	return limitBashOutput(bashOutput(result)), nil
+}
 
-	// 【驾驭底线 4】：长度截断保护 (防 OOM)
-	const maxLen = 8000
-	if len(outputStr) > maxLen {
-		return fmt.Sprintf("%s\n\n...[终端输出过长，已截断至前 %d 字节]...", outputStr[:maxLen], maxLen), nil
+func bashOutput(result executor.Result) string {
+	if result.Stdout == "" && result.Stderr == "" {
+		return "命令执行成功，无终端输出。"
 	}
+	if result.Stderr == "" {
+		return result.Stdout
+	}
+	return bashStreams(result, maxBashOutputBytes)
+}
 
-	return outputStr, nil
+const maxBashOutputBytes = 8000
+
+func bashFailureOutput(status string, result executor.Result) string {
+	status = limitBashText(status, 1024)
+	return status + "\n\n" + bashStreams(result, maxBashOutputBytes-len(status)-2)
+}
+
+// Budget both streams so a large stdout cannot hide stderr or the exit status.
+func bashStreams(result executor.Result, budget int) string {
+	remaining := budget - len("STDOUT:\n\nSTDERR:\n")
+	stdoutBudget := remaining / 2
+	stderrBudget := remaining - stdoutBudget
+	if len(result.Stdout) < stdoutBudget {
+		stderrBudget += stdoutBudget - len(result.Stdout)
+	} else if len(result.Stderr) < stderrBudget {
+		stdoutBudget += stderrBudget - len(result.Stderr)
+	}
+	return fmt.Sprintf("STDOUT:\n%s\nSTDERR:\n%s", limitBashText(result.Stdout, stdoutBudget), limitBashText(result.Stderr, stderrBudget))
+}
+
+func limitBashOutput(output string) string { return limitBashText(output, maxBashOutputBytes) }
+
+// The truncation marker is included in the budget, including on failure paths.
+func limitBashText(output string, budget int) string {
+	if len(output) <= budget {
+		return output
+	}
+	const marker = "\n\n...[终端输出过长，已截断]..."
+	end := budget - len(marker)
+	for end > 0 && !utf8.RuneStart(output[end]) {
+		end--
+	}
+	return output[:end] + marker
 }

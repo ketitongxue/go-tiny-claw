@@ -2,15 +2,32 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/ketitongxue/go-tiny-claw/internal/eval"
+	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 )
 
 func main() {
+	sandbox := flag.String("sandbox", executor.ModeAuto, "执行后端：auto、docker、local（不安全）")
+	image := flag.String("sandbox-image", executor.DefaultImage, "预先构建的 Sandbox 镜像")
+	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if *sandbox == executor.ModeLocal {
+		log.Print("WARNING: Benchmark 使用宿主 LocalExecutor（UNSAFE），命令拥有当前用户权限；workdir 不是隔离边界。请勿执行不可信代码。")
+	}
 	if os.Getenv("ZHIPU_API_KEY") == "" {
 		log.Fatal("请先导出 ZHIPU_API_KEY 环境变量进行跑分测试")
+	}
+
+	exec, err := executor.NewConfigured(ctx, *sandbox, *image, executor.CodingPolicy())
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	// 构建一套微型评测集
@@ -39,6 +56,6 @@ func main() {
 
 	// 启动跑分执行器！
 	// 我们选用国内极其廉价但能力不错的 glm-4.5-air 跑分，省点钱。
-	runner := eval.NewBenchmarkRunner("glm-5.2")
-	runner.RunSuite(context.Background(), testcases)
+	runner := eval.NewBenchmarkRunner("glm-5.2", exec)
+	runner.RunSuite(ctx, testcases)
 }

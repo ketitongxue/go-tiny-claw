@@ -114,9 +114,16 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 
 	// 4. 封装结果：将执行结果或底层物理错误封装后返回给 Main Loop
 	if err != nil {
+		// A tool may return useful partial output together with an error (e.g.
+		// Bash stdout/stderr + exit code). Preserve it for Recovery and the model.
+		if output == "" {
+			output = fmt.Sprintf("Error executing %s: %v", call.Name, err)
+		}
+		span.AddAttribute("is_error", true)
+		span.AddAttribute("output_preview", truncate(output, 100))
 		return schema.ToolResult{
 			ToolCallID: call.ID,
-			Output:     fmt.Sprintf("Error executing %s: %v", call.Name, err),
+			Output:     output,
 			IsError:    true,
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
+	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 	"github.com/ketitongxue/go-tiny-claw/internal/tools"
 )
@@ -41,6 +42,7 @@ type recordingReporter struct {
 	thinking int
 	calls    []string
 	results  []string
+	errors   []bool
 	messages []string
 }
 
@@ -54,10 +56,11 @@ func (r *recordingReporter) OnToolCall(_ context.Context, name, _ string) {
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, name)
 }
-func (r *recordingReporter) OnToolResult(_ context.Context, name, _ string, _ bool) {
+func (r *recordingReporter) OnToolResult(_ context.Context, name, _ string, isError bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.results = append(r.results, name)
+	r.errors = append(r.errors, isError)
 }
 func (r *recordingReporter) OnMessage(_ context.Context, content string) {
 	r.mu.Lock()
@@ -174,6 +177,69 @@ func TestRunPassesRecoveryAndRepeatedFailureReminderToModel(t *testing.T) {
 	session.Append(schema.Message{Role: schema.RoleUser, Content: "read file"})
 	if err := NewAgentEngine(p, registry, false, false).Run(context.Background(), session, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type executorFunc func(context.Context, executor.Request, executor.OutputHandler) (executor.Result, error)
+
+func (f executorFunc) Execute(ctx context.Context, req executor.Request, output executor.OutputHandler) (executor.Result, error) {
+	return f(ctx, req, output)
+}
+
+func TestBashFailureRecoveryReachesNextModelTurn(t *testing.T) {
+	for _, tc := range []struct {
+		name, command, expected string
+		runner                  executor.Executor
+	}{
+		{"command", "echo partial; echo problem >&2; exit 7", "Command exited with code 7", executor.NewLocalExecutor()},
+		{"infrastructure", "echo unreachable", "docker daemon unavailable", executorFunc(func(context.Context, executor.Request, executor.OutputHandler) (executor.Result, error) {
+			return executor.Result{ExitCode: -1}, &executor.InfrastructureError{Op: "docker run", Err: errors.New("docker daemon unavailable")}
+		})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := ctxpkg.NewSession("bash-recovery", t.TempDir())
+			session.Append(schema.Message{Role: schema.RoleUser, Content: "run command"})
+			registry := tools.NewRegistry()
+			registry.Register(tools.NewBashTool(session.WorkDir, tc.runner, executor.CodingPolicy()))
+			calls := 0
+			p := providerFunc(func(_ context.Context, msgs []schema.Message, _ []schema.ToolDefinition) (*schema.Message, error) {
+				calls++
+				if calls > 1 {
+					found := false
+					for _, msg := range msgs {
+						if msg.ToolCallID != "" && strings.Contains(msg.Content, tc.expected) && strings.Contains(msg.Content, "[系统救援指南]") {
+							found = true
+							if tc.name == "command" && (!strings.Contains(msg.Content, "partial") || !strings.Contains(msg.Content, "problem")) {
+								return nil, errors.New("lost command output in Observation")
+							}
+						}
+					}
+					if !found {
+						return nil, errors.New("Bash failure/recovery not visible to next model turn")
+					}
+				}
+				if calls == 4 {
+					if !strings.Contains(msgs[len(msgs)-1].Content, "SYSTEM REMINDER") {
+						return nil, errors.New("Bash failure did not trigger repeated-failure reminder")
+					}
+					return &schema.Message{Role: schema.RoleAssistant, Content: "correcting"}, nil
+				}
+				args, _ := json.Marshal(map[string]string{"command": tc.command})
+				return &schema.Message{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: fmt.Sprint(calls), Name: "bash", Arguments: args}}}, nil
+			})
+			reporter := &recordingReporter{}
+			if err := NewAgentEngine(p, registry, false, false).Run(context.Background(), session, reporter); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 4 || len(reporter.errors) != 3 {
+				t.Fatalf("calls=%d errors=%v", calls, reporter.errors)
+			}
+			for _, isError := range reporter.errors {
+				if !isError {
+					t.Fatal("reporter received successful Bash failure")
+				}
+			}
+		})
 	}
 }
 

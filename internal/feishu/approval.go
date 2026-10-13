@@ -137,7 +137,9 @@ func (m *ApprovalManager) ResolveApprovalForChat(chatID, taskID string, allowed 
 	}
 }
 
-// IsDangerousCommand 简单的正则检查黑名单，判断该工具调用是否需要审批
+// IsDangerousCommand is a heuristic Human Approval Layer, not a Security
+// Boundary. Sandbox permissions must still be enforced even if a regex misses
+// a dangerous command or a human approves it.
 func IsDangerousCommand(toolName string, args string) bool {
 	// 对于纯读取的工具，默认 YOLO 模式，全部放行
 	if toolName != "bash" && toolName != "write_file" && toolName != "edit_file" {

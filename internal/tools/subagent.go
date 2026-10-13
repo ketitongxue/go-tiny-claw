@@ -68,9 +68,9 @@ func (t *SubagentTool) Execute(ctx context.Context, args json.RawMessage) (strin
 
 	log.Printf("[Subagent] 🚀 主 Agent 发起委派！正在拉起探路者: [%s]...\n", input.TaskPrompt)
 
-	// 【核心降维打击】：拉起一个完全物理隔离的子循环
-	// 我们把针对该任务的专项指令传给子智能体，并仅提供 readOnlyRegistry。
-	// (子智能体只能读文件或执行只读的 bash，不能搞破坏)
+	// The registry restricts tools, not OS permissions. Application wiring must
+	// supply an RO sandbox executor for Explorer Bash, or omit Bash when no
+	// read-only backend exists (e.g. explicit unsafe Local mode).
 	summary, err := t.runner.RunSub(ctx, input.TaskPrompt, t.readOnlyRegistry, t.reporter)
 
 	if err != nil {

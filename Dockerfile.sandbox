@@ -1,0 +1,17 @@
+FROM golang:1.26.2-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash git curl ca-certificates ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/local/go/bin/go /usr/local/bin/go \
+    && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+
+# RootFS is read-only at runtime. All ephemeral caches live in the bounded tmpfs.
+# Symlinks above keep Go on PATH even when bash -l loads /etc/profile.
+ENV HOME=/tmp \
+    GOCACHE=/tmp/go-build \
+    GOMODCACHE=/tmp/go-mod \
+    GOTOOLCHAIN=local
+
+WORKDIR /workspace
+CMD ["bash"]

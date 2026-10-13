@@ -38,12 +38,13 @@ func (rm *RecoveryManager) AnalyzeAndInject(toolName string, rawError string) st
 
 	case "bash":
 		if strings.Contains(lowerError, "command not found") {
-			hint = "系统中未安装该命令。请先思考：是否有替代命令？或者你需要先编写脚本进行安装？"
-		} else if strings.Contains(rawError, "超时") || strings.Contains(rawError, "DeadlineExceeded") {
-			// 匹配我们手写的 30s context.WithTimeout 报错
-			hint = "该命令执行被超时强杀。如果它是一个常驻服务（如 server 或 watch），请将其转入后台执行（例如使用 `nohup ... &`），不要阻塞主线程。"
+			hint = "执行环境未安装该命令。请优先使用已有替代命令；若必须安装依赖，请报告需要更新可信 Sandbox 镜像，不要切换宿主执行或绕过网络限制。"
+		} else if strings.Contains(rawError, "超时") || strings.Contains(lowerError, "deadline exceeded") {
+			hint = "该命令已因超时终止。请缩小任务范围或拆成更短的命令；不要依赖后台进程，执行环境会在命令结束后清理。"
 		} else if strings.Contains(lowerError, "syntax error") {
 			hint = "Bash 语法错误。请检查引号转义或特殊字符，确保命令在终端中可直接运行。"
+		} else {
+			hint = "命令执行失败。请检查退出码、stdout 和 stderr，修正原因后再尝试。若执行环境不可用或权限被拒绝，请报告问题，不要绕过 Sandbox 或切换到宿主执行。"
 		}
 	}
 
