@@ -26,7 +26,7 @@ func TestDockerSessionFactoryIntegration(t *testing.T) {
 	if err := probe.CheckImage(context.Background()); err != nil {
 		t.Skipf("build the sandbox image first: %v", err)
 	}
-	opts := options{mode: "demo", model: "glm-5.2", workDir: t.TempDir(), sandbox: executor.ModeDocker, sandboxImage: image}
+	opts := options{mode: "demo", model: "glm-5.3", workDir: t.TempDir(), sandbox: executor.ModeDocker, sandboxImage: image}
 	executors, err := configureExecutors(context.Background(), opts, io.Discard)
 	if err != nil {
 		t.Fatal(err)

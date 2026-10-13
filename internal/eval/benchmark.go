@@ -62,7 +62,7 @@ func (b *BenchmarkRunner) RunSuite(ctx context.Context, testcases []TestCase) {
 
 		if res.Passed {
 			passedCount++
-			log.Printf(">>> ✅ 用例 [%s] 测试通过! | 耗时: %dms | 花费: $%.6f\n", tc.ID, res.DurationMs, res.TotalCostCNY)
+			log.Printf(">>> ✅ 用例 [%s] 测试通过! | 耗时: %dms | 估算费用 (CNY): ¥%.6f\n", tc.ID, res.DurationMs, res.TotalCostCNY)
 		} else {
 			log.Printf(">>> ❌ 用例 [%s] 测试失败! | 错误: %s\n", tc.ID, res.ErrorMsg)
 		}
@@ -72,7 +72,7 @@ func (b *BenchmarkRunner) RunSuite(ctx context.Context, testcases []TestCase) {
 	// 打印终极报表
 	log.Println("\n================ 🏆 跑分终极报告 ================")
 	log.Printf("总用例数: %d | 成功数: %d | 成功率: %.2f%%\n", len(testcases), passedCount, float64(passedCount)/float64(len(testcases))*100)
-	log.Printf("总消耗成本: $%.6f\n", totalCost)
+	log.Printf("总估算成本 (CNY): ¥%.6f\n", totalCost)
 	log.Println("==================================================")
 }
 

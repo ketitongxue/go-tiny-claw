@@ -1234,25 +1234,34 @@ Agent.Run
 
 CostTracker 会记录：
 
-- Prompt Tokens
+- Prompt Tokens（包含缓存命中）
 - Completion Tokens
+- Cached Prompt Tokens（缓存命中）
 - API Latency
 
-并累加到 Session。
+输入、输出 Token 总量与人民币估算费用累加到 Session，缓存命中数量显示在单次调用日志中。
 
-当前价格表是代码内硬编码的实验性配置。
+`internal/observability/tracker.go` 中的价格表按官方价格截图配置，单位为**元/百万 Tokens（CNY）**：
 
-默认 `claw` 使用：
+| 模型 | 输入单价 | 输出单价 | 缓存命中单价 | 缓存存储 |
+| --- | ---: | ---: | ---: | --- |
+| GLM-5.3 | 8 | 28 | 2 | 限时免费 |
+| GLM-5.3-Flash | 0.8 | 2.8 | 0.23 | 限时免费 |
+| GLM-5.3-FlashX | 2 | 7 | 0.57 | 限时免费 |
+
+默认 `claw` 使用 `glm-5.3`，费用计算为：
 
 ```text
-glm-5.3
+费用（元）= ((输入总量 - 缓存命中量) × 输入单价
+           + 缓存命中量 × 缓存命中单价
+           + 输出量 × 输出单价) / 1,000,000
 ```
 
-而当前 PricingModel 尚未配置 `glm-5.3` 的价格，因此：
+OpenAI-compatible Provider 从 `usage.prompt_tokens_details.cached_tokens` 提取缓存命中数量；未返回该字段时按无缓存命中估算。缓存存储当前不计费，限时免费结束后需重新更新配置与计费逻辑。
 
-> Token 统计仍然有效，但默认模型的费用估算可能显示为 0。
+未配置价格的模型（包括截图未列出的 `glm-5.2`）仍统计 Token，但会输出警告，费用为 0 **不代表免费**，不再使用旧的假定单价。
 
-成本统计目前只适合辅助观察，不应作为正式账单依据。
+以上是按量 API 价格估算，不代表 Coding Plan 套餐的实际扣费，也不应作为正式账单依据。
 
 ---
 

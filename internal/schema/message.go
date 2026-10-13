@@ -4,8 +4,9 @@ import "encoding/json"
 
 // Usage 记录了单次大模型 API 调用的 Token 消耗
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`     // 输入的 Token 数量
-	CompletionTokens int `json:"completion_tokens"` // 产生的 Token 数量
+	PromptTokens       int `json:"prompt_tokens"`                  // 输入的 Token 总量，包含缓存命中
+	CompletionTokens   int `json:"completion_tokens"`              // 产生的 Token 数量
+	CachedPromptTokens int `json:"cached_prompt_tokens,omitempty"` // 输入中缓存命中的 Token 数量
 }
 
 // Role 定义消息的角色，这是与大模型沟通的基石

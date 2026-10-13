@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -172,7 +173,7 @@ func TestCheckConfigDoesNotStartModelOrCreateWorkspace(t *testing.T) {
 }
 
 func TestSessionFactoryRunsExistingToolsAndSubagent(t *testing.T) {
-	runSessionFactoryRegression(t, options{mode: "feishu", model: "glm-5.2", workDir: t.TempDir()}, sessionExecutors{
+	runSessionFactoryRegression(t, options{mode: "feishu", model: "glm-5.3", workDir: t.TempDir()}, sessionExecutors{
 		coding: executor.NewLocalExecutor(),
 		explorer: executorFunc(func(_ context.Context, req executor.Request, _ executor.OutputHandler) (executor.Result, error) {
 			if strings.Contains(req.Command, "echo hacked") {
@@ -267,7 +268,7 @@ func runSessionFactoryRegression(t *testing.T, opts options, executors sessionEx
 	if err := eng.Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
 	}
-	if input, output, cost := sess.UsageTotals(); input != 90 || output != 18 || cost <= 0 {
+	if input, output, cost := sess.UsageTotals(); input != 90 || output != 18 || math.Abs(cost-0.001224) > 1e-12 {
 		t.Fatalf("main + subagent accounting = %d/%d/%f", input, output, cost)
 	}
 	if input, output, cost := other.UsageTotals(); input != 0 || output != 0 || cost != 0 {

@@ -135,11 +135,12 @@ func (p *OpenAIProvider) Generate(ctx context.Context, msgs []schema.Message, av
 		Content: choice.Content,
 	}
 
-	// 【新增】提取 Usage 信息
+	// 提取 Usage 信息；缓存命中已经包含在 PromptTokens 中，不能重复计费。
 	if resp.Usage.PromptTokens > 0 || resp.Usage.CompletionTokens > 0 {
 		resultMsg.Usage = &schema.Usage{
-			PromptTokens:     int(resp.Usage.PromptTokens),
-			CompletionTokens: int(resp.Usage.CompletionTokens),
+			PromptTokens:       int(resp.Usage.PromptTokens),
+			CompletionTokens:   int(resp.Usage.CompletionTokens),
+			CachedPromptTokens: int(resp.Usage.PromptTokensDetails.CachedTokens),
 		}
 	}
 
