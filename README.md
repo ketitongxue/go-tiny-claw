@@ -51,8 +51,12 @@
 | Human Approval                      | ✅           |
 | Thinking Mode                       | ✅ 可选        |
 | Plan Mode                           | ✅ 可选        |
-| AGENTS.md                           | ✅           |
-| Skills                              | ✅           |
+| Structured Prompt / Section Hashes  | ✅           |
+| Tool-driven Prompt Rules            | ✅ Main / Explorer |
+| Hierarchical AGENTS / override      | ✅           |
+| Skills Lazy Loading                 | ✅ metadata only |
+| SYSTEM / APPEND_SYSTEM              | ✅           |
+| Project Trust / Prompt Debug CLI     | ✅           |
 | Token-aware Context                 | ✅           |
 | Old Char Compactor                  | ❌ removed   |
 | Feishu Auto Resume                  | ✅           |
@@ -88,10 +92,14 @@
                   Session
                      │
                      ▼
-              PromptComposer
-             ┌───────┼────────┐
-             │       │        │
-         AGENTS.md  Skills   Plan
+               PromptService ← ResourceLoader
+                     │          (AGENTS / SYSTEM / Skills / Trust)
+                     ▼
+Tool Registry → PromptComposer ← Runtime / Plan
+                     │
+                     ▼
+                PromptState
+           (Sections / Hashes / Content)
                      │
                      ▼
               ContextBuilder
@@ -153,7 +161,8 @@ go-tiny-claw/
 ├── internal/
 │   ├── context/
 │   │   ├── session.go
-│   │   ├── composer.go
+│   │   ├── composer.go / sections.go / builtin.go
+│   │   ├── prompt_service.go / resources.go / resource_path.go
 │   │   ├── service.go
 │   │   ├── builder.go / policy.go / estimator.go
 │   │   ├── recovery.go
@@ -182,6 +191,9 @@ go-tiny-claw/
 │   │   ├── trace.go
 │   │   └── tracker.go
 │   │
+│   ├── project/                  # canonical project identity / trust registry
+│   ├── agenthome/                # 共享 Global Agent Home 路径解析
+│   ├── promptinfo/               # 独立于 Tool Schema 的 Prompt Metadata
 │   ├── app/                      # Provider/Auth/Config 装配入口
 │   ├── auth/                     # Credential Store / PKCE / Refresh
 │   ├── config/                   # Global Agent Home / config / custom models
@@ -291,14 +303,21 @@ CLI → ModelRef → ProviderManager → LLMProvider → AgentEngine
 
 ```text
 ~/.claw/                         # 全局配置，不是 Agent 工作区
-├── config.json                  # 普通配置：default_model
+├── config.json                  # 普通配置：default_model / language / context
+├── AGENTS.md                    # 用户级默认指令，可选
+├── SYSTEM.md                    # 用户级 core 替换，可选
+├── APPEND_SYSTEM.md             # 用户级追加，可选
+├── trusted-projects.json        # canonical project roots，claw trust 管理
+├── sessions/                    # 敏感完整会话，不挂载给 Agent
 ├── auth.json                    # API Key / OAuth / ID Token，0600，明文凭据
 ├── host.json                    # 稳定 OpenAI installation Host ID，非凭据
 ├── openai-models.json            # 绑定 OAuth 账号/注册的模型缓存，无 token
 └── models.json                  # 自定义 Provider / 模型目录
 
 <workspace>/.claw/               # 工作区资料，可被 Agent 访问
-├── skills/
+├── SYSTEM.md                    # 需 Project Trust
+├── APPEND_SYSTEM.md             # 需 Project Trust
+├── skills/                      # 需 Project Trust，仅发现 metadata
 └── traces/
 ```
 
@@ -932,13 +951,68 @@ SandboxPolicy
 
 ---
 
-# AGENTS.md
+# Prompt Architecture / SYSTEM / Project Trust
 
-可以在 WorkDir 根目录增加：
+Prompt 是每次 `Run` 的运行时组合结果，不是一份不断增大的固定字符串：
 
 ```text
-AGENTS.md
+Filesystem → ResourceLoader → PromptResources
+Tool Registry → ToolPromptMetadata
+Runtime / Plan / Language
+             ↓
+       PromptService
+             ↓
+       PromptComposer（纯组装，无磁盘 IO）
+             ↓
+       PromptState → ContextBuilder → Provider
 ```
+
+固定顺序为 `core → tools → rules → user_context → project_context → skills → runtime → plan → addendum`。空 Section 不输出；除 core 外使用 XML 风格边界，资源文本转义且保留换行。每个 Section 有 SHA256；Provider 仍接收完整 rendered string，Session 不保存 Prompt diff。
+
+`tools` 和去重后的 `rules` 来自实际 Registry 的可选 `PromptAwareTool` metadata，不复制参数 schema。Main 包含 read/write/edit/bash/subagent；Docker Explorer 仅 read/bash，Local Explorer 仅 read，不再带 write/edit 使用规则。普通 Tool 无需实现可选接口仍可运行。内置 Core 只保留身份、目标和基础工作原则；Plan 工作流留在 `plan`。
+
+## SYSTEM / APPEND_SYSTEM
+
+- Core 优先级：`<workdir>/.claw/SYSTEM.md`（已信任）→ `<CLAW_HOME>/SYSTEM.md` → 内置 Core。空 SYSTEM 文件也会替换 Core。
+- Append 顺序：用户 `APPEND_SYSTEM.md` → 项目 `.claw/APPEND_SYSTEM.md`（已信任），进入最后的 `addendum`，保留来源路径。
+- SYSTEM 只替换 Core，不替换 tools/rules/runtime/plan，更不改变 Tool Schema、Executor、Sandbox、Provider 或审批。Explorer 的运行时只读角色也保留。
+- 用户目录默认为 `~/.claw`，可通过 `CLAW_HOME` 指定。语言属于运行时偏好，`config.json` 支持 `"language":"zh-CN"`（默认）或 `"language":"en-US"`，不再写在 Core identity 中。Demo、Feishu、Benchmark 共用该偏好。
+- AGENTS 和 SYSTEM/APPEND 单文件上限 1 MiB；坏 AGENTS 告警并跳过，存在但不可读/越界/非普通/超限的 SYSTEM 或 APPEND 报错，不静默退回默认。缺失可选文件不告警。
+
+## Project Trust
+
+未信任项目仍加载普通 `AGENTS.md` / `AGENTS.override.md`，但**不读取**项目 `.claw/SYSTEM.md`、`.claw/APPEND_SYSTEM.md` 和 `.claw/skills/`；发现时明确告警并提示 trust。用户级资源不受项目 Trust 门禁影响。
+
+```bash
+claw trust -workdir ./my-project          # 信任当前 Git root；非 Git 则为 WorkDir
+claw trust status -workdir ./my-project
+claw trust revoke -workdir ./my-project
+# 在项目内可直接用 claw trust / claw trust status / claw trust revoke
+```
+
+Registry 保存到 `<CLAW_HOME>/trusted-projects.json`（0600、原子写入）；按 canonical Git root / WorkDir 精确匹配，不用路径前缀继承。损坏或不可读时 fail closed：告警并禁用项目高权限资源。更新锁冲突明确拒绝重试，不丢失其他命令的操作；崩溃遗留 `.lock` 目录需确认无 trust 命令运行后清理。
+
+**Project Trust ≠ Security Sandbox。** Trust 只表示允许项目影响 Prompt/Resource；指令文件也不是安全边界。真正边界仍是 Registry、Executor、SandboxPolicy、Human Approval、Path Boundary。信任是按路径授权，不是逐文件内容审核；文件改动会在下次构建 Prompt 时生效。
+
+## 离线调试
+
+```bash
+claw prompt show -workdir ./my-project
+claw prompt render -workdir ./my-project  # WARNING：可能含敏感项目指令
+claw prompt render -workdir ./my-project -agent explorer -sandbox docker
+claw prompt render -workdir ./my-project -agent explorer -sandbox local
+claw prompt show -workdir ./my-project -plan
+```
+
+`show` 默认只显示 Section、来源、字节大小和 Token 估算，不显示正文；`render` 显式输出完整 Prompt。命令不要求凭据、不加载 Auth/Model 目录、不连接 Docker/飞书、不创建 Session 或 Trace；`-sandbox` 只选择对应工具集合，不证明 Sandbox 可用。新增命令的 `-workdir` 默认是当前目录 `.`，**运行 Agent 的默认仍为 `workspace`**，调试时应显式保持一致。不要分享 render 输出。
+
+# AGENTS.md
+
+支持用户级 `<CLAW_HOME>/AGENTS.md`（默认 `~/.claw/AGENTS.md`），以及 Git root 到当前 WorkDir 的层级指令。加载顺序：用户 → Repo Root → 中间父目录 → 当前目录；越近的指令语义优先。同目录存在 `AGENTS.override.md` 时不加载 `AGENTS.md`，即使 override 损坏也只告警，不退回普通文件。
+
+无 Git 标记时只加载 WorkDir，不读取任意父目录指令；Linked Worktree 的 `.git` 文件直接作为当前 worktree 边界，不扫描 main worktree。Context 文件使用 canonical path 去重，必须是本作用域内的普通文件；内部文件 symlink 可用，越界 symlink 被跳过并告警。Global Agent Home 必须与整个项目 Context Root 分离，避免父级指令通过 symlink 暴露全局凭据。
+
+每份指令在 `user_context` / `project_context` 中保留 `<instruction path="..." scope="...">` 来源。只针对**启动时 WorkDir 及其祖先**发现，不随工具进入目录而自动加载子树规则，不兼容 CLAUDE.md。
 
 例如：
 
@@ -952,7 +1026,7 @@ AGENTS.md
 - 不要修改与当前任务无关的文件
 ```
 
-AgentEngine 每次 `Run` 开始时都会重新构建 System Prompt，并加载该文件。
+每次 `Run`（包括 Session/Feishu Resume）通过 PromptService 重新发现资源、检查 Trust 并构建 Prompt；AgentEngine 不解析这些文件。已有磁盘 Session History 与 Model Pinning 不变。运行中的单次 Run 不热更新 Prompt。
 
 ---
 
@@ -998,9 +1072,17 @@ SkillLoader 会递归查找：
 .claw/skills/**/SKILL.md
 ```
 
-并注入当前 Agent Run 的 System Prompt。
+但只在项目已 Trust 时发现，并且 System Prompt **只包含 name、description、canonical location 和工作区相对 read_path，不注入正文**。任务明显匹配描述时，模型应先用现有 `read_file` 读取对应 SKILL.md；Skill 中的相对引用以该文件的 canonical 所在目录为基准，再转成工作区相对路径。`location` 是宿主路径，不应原样传给只接受相对路径的文件工具，Docker Bash 也不使用宿主绝对路径。
 
-当前 Skills 是提示词扩展机制，不是独立执行插件系统。
+```bash
+claw trust -workdir ./workspace
+claw prompt show -workdir ./workspace
+claw -mode demo -workdir ./workspace -prompt "帮我补 Go 单元测试"
+```
+
+name（1–128 字符）、description（1–2048 字符）必填，YAML frontmatter 上限 16 KiB，支持原有 quoted/multiline 格式。metadata 无效时告警并跳过单个 Skill；同名按字典序路径先加载的有效 Skill 优先，后续拒绝并告警。SKILL.md 必须存在且为工作区内 regular file；内部文件 symlink canonicalize 后加载并去重，越界拒绝，嵌套目录 symlink 不递归。
+
+大型正文不参与 Prompt 大小；10+ Skills 的系统上下文只随 metadata 增长。正文被模型按需读取后仍会作为普通 Tool Output 进入 Session/ContextBuilder，受现有 Token Budget 约束。当前只支持当前 WorkDir `.claw/skills/`，不支持用户级/父目录/远程 Skills；不是独立执行插件系统。
 
 ---
 
@@ -1386,7 +1468,7 @@ Agent.Run
     └── LLM.Action
 ```
 
-Root Span 还包含 `provider_id`、`model_id`、`billing_mode`、`auth_type`；不包含 Key、token 或 Authorization header。
+Root Span 还包含 `provider_id`、`model_id`、`billing_mode`、`auth_type`，以及 `prompt.section_count`、`prompt.sections`、`prompt.core_hash`、`prompt.project_context_hash`、`prompt.skills_hash`、`prompt.estimated_tokens`、`prompt.skills_count`、`prompt.context_files_count`；不记录完整 System Prompt，也不包含 Key、token 或 Authorization header。按需读取资源仍属于普通 Tool Output，现有 Session 与 Tool Trace preview 可能含敏感内容，需独立保护。
 
 用于：
 
@@ -1552,7 +1634,10 @@ Race / 静态检查与 Session Store 性能观测：
 go test -race ./...
 go vet ./...
 go test -bench=FileStore -benchmem ./internal/sessionstore
+go test -bench=Prompt -benchmem ./internal/context/...
 ```
+
+Prompt Main/Explorer Golden 使用固定虚拟路径，位于 `internal/context/testdata/`。修改规则后审查 diff，再显式运行 `go test ./internal/context -run TestPromptGolden -update-prompt-golden` 更新；不要盲目刷新。M5.2 架构、测试及人工验收见 [M5.2 Report](docs/M5.2-report.md)。
 
 FileStore Benchmark 比较 100 / 1000 条历史消息的单次 Append（包含 fsync）；不设绝对耗时 SLA。确定性测试另外验证 fast path 不读取完整历史，并覆盖跨进程冲突、活动 Session 只读访问及 SIGKILL 后锁释放。M5.1 变更与人工验收见 [M5.1 Report](docs/M5.1-report.md)。
 
@@ -1763,8 +1848,8 @@ Task Deadline
 建议后续演进方向：
 
 ```text
-1. Session JSONL Persistence + Resume（M5 已完成）
-2. Git Checkpoint / Diff / Rollback（等待人工验收，不自动开始）
+1. Session Persistence / Hardening、Prompt Architecture（M5 / M5.1 / M5.2 已实现，M5.2 等待人工验收）
+2. Git Checkpoint / Diff / Rollback（不自动开始 M6）
 3. Task Verifier
 4. Streaming / Cancel / Steering
 5. Session-scoped Sandbox Container

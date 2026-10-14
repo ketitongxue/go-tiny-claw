@@ -83,8 +83,10 @@ func TestPromptComposerRetainsWorkspaceInstructionsSkillsAndPlanMode(t *testing.
 	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: verify\ndescription: verification tasks\n---\nUse the workspace verification procedure."), 0600); err != nil {
 		t.Fatal(err)
 	}
+	home := t.TempDir()
+	trustWorkspace(t, home, dir)
 	for _, plan := range []bool{false, true} {
-		state, err := (PromptService{}).Build(dir, nil, plan, false)
+		state, err := (PromptService{Resources: ResourceLoader{Home: home}}).Build(dir, nil, plan, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -92,10 +94,13 @@ func TestPromptComposerRetainsWorkspaceInstructionsSkillsAndPlanMode(t *testing.
 		if msg.Role != schema.RoleSystem {
 			t.Fatal("composer did not create a system prompt")
 		}
-		for _, expected := range []string{"workspace-specific instruction", "verification tasks", "Use the workspace verification procedure."} {
+		for _, expected := range []string{"workspace-specific instruction", "verification tasks", "<name>verify</name>"} {
 			if !strings.Contains(msg.Content, expected) {
 				t.Errorf("missing %q from prompt", expected)
 			}
+		}
+		if strings.Contains(msg.Content, "Use the workspace verification procedure.") {
+			t.Fatal("skill body was eagerly injected")
 		}
 		if strings.Contains(msg.Content, "Plan Mode: ON") != plan {
 			t.Errorf("plan mode not reflected in prompt: %v", plan)

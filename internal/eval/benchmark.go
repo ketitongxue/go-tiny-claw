@@ -30,6 +30,7 @@ type TestResult struct {
 	ErrorMsg   string
 }
 type BenchmarkRunner struct {
+	Prompts  ctxpkg.PromptSource
 	provider provider.LLMProvider
 	model    provider.ModelInfo
 	authType string
@@ -108,6 +109,9 @@ func (b *BenchmarkRunner) runSingleTest(ctx context.Context, tc TestCase) TestRe
 	registry.Register(tools.NewBashTool(workDir, b.executor, executor.CodingPolicy()))
 	registry.Register(tools.NewEditFileTool(workDir))
 	eng := engine.NewAgentEngine(tracked, registry, false, false)
+	if b.Prompts != nil {
+		eng.Prompts = b.Prompts
+	}
 	err = session.Append(ctx, schema.Message{Role: schema.RoleUser, Content: tc.TaskPrompt})
 	if err == nil {
 		err = eng.Run(ctx, session, nil)

@@ -18,6 +18,7 @@ type PromptState struct {
 	Sections                       []PromptSection
 	Content                        string
 	Hashes                         map[string]string
+	Sources                        map[string][]string // local debug only; never instruction bodies
 	SkillsCount, ContextFilesCount int
 }
 

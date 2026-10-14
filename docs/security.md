@@ -3,7 +3,7 @@
 ## Credential 与 Global Agent Home
 
 - 全局 `~/.claw/config.json` 只保存普通设置，`models.json` 保存自定义 Provider/模型目录；API Key、OAuth access/refresh/ID Token 仅存放 `~/.claw/auth.json`。`host.json` 保存 installation Host ID，`openai-models.json` 保存无 token 的账号绑定模型缓存。可用 `CLAW_HOME` 显式更改全局位置，但不能放在工作区里。
-- `<workspace>/.claw/` 保存 skills/traces，**不是** Credential Store。启动入口拒绝工作区与 Global Agent Home 互相包含（包括可解析的 symlink 路径），文件工具原有 workspace 路径检查仍保持。
+- `<workspace>/.claw/` 保存项目 SYSTEM/APPEND_SYSTEM、skills/traces，**不是** Credential Store。启动入口拒绝工作区与 Global Agent Home 互相包含（包括可解析的 symlink 路径）；ResourceLoader 还拒绝 Global Agent Home 落在整个 Git Context Root 内，以免父级 AGENTS symlink 暴露全局资料。文件工具原有 workspace 相对路径检查保持，不为加载 Skill 放宽。
 - 认证信息只由宿主 AuthManager 和 Provider transport 使用，不进入 Prompt、Tool Arguments、Session Message、Workspace、Trace 或 Sandbox Env。Trace 仅记录 provider/model、billing mode 和 auth type。
 - `auth.json` 是**明文密码级资料**，文件权限必须为 Unix `0600`。保存使用同目录临时文件（0600）、fsync/close、rename；读取已有宽权限文件时自动修复为 0600，无法修复则报错；拒绝 symlink/非普通文件。不提交、不粘贴进日志/issue，不把它复制进 workspace，不烘焙进镜像。
 - API Key 可来自 AuthStore 或明确配置的环境变量，AuthStore 优先。logout 只清除 Store，环境变量仍可能提供凭据。自定义配置仅接受 none 或 api_key + env，禁止明文 literal key、shell/command credentials、自定义 OAuth 和覆盖内置 Provider。
@@ -28,6 +28,28 @@ M5.1 使用 **每 Session、单进程 writer ownership**：macOS / Linux 的 OS 
 **Session writer lock 不是安全边界**，仅用于合作进程的一致性保护，不阻止同一 OS 用户、LocalExecutor 或其他绕过协议的程序直接修改文件。它不实现多进程同时写同一 Session，不覆盖 AuthStore / OAuth refresh，不提供分布式 / 网络文件系统锁保证。当前 writer lock 仅支持 macOS / Linux；其他平台的 mutation 会明确拒绝，而不是静默无锁运行。Session JSONL 仍是敏感本地明文数据，锁不提供保密性、磁盘加密、配额或安全擦除。
 
 ContextBuilder 的省略与截断仅是当前 Provider 请求视图，绝不回写历史。Thinking 正文默认不进入 Conversation / Trace。`session delete` 只删除 Session 文件，不能删除 WorkDir、代码、Trace，也不保证底层存储上的安全擦除；备份和 Trace 需独立管理。
+
+## Prompt Resources / Project Trust
+
+Prompt 架构只改变模型指令的发现和组合，不改变模型 API、Session JSONL、Tool Schema、执行权限或审批。AgentEngine 只消费 `PromptSource → PromptState`；ResourceLoader 负责磁盘文件、信任与 diagnostics，Composer 仅做固定顺序的纯组装。
+
+**Project Trust ≠ Security Sandbox。** `AGENTS.md`、`AGENTS.override.md`、`SYSTEM.md`、`APPEND_SYSTEM.md`、`SKILL.md` 全部只是 Model Instructions，不能作为 Security Boundary。真实安全机制仍是 Tool Registry、Executor、SandboxPolicy、Human Approval 和 Path Boundary。不要因为某项目已经 trust 就启用 LocalExecutor 或放宽网络/挂载；Prompt Injection 不会因存在 Sandbox 或 Trust 消失。
+
+当前采用 normal-like 单一规则（未实现 strict 模式）：
+
+- 用户级 `<CLAW_HOME>/AGENTS.md`、`SYSTEM.md`、`APPEND_SYSTEM.md` 视为用户配置。Global Agent Home 默认 `~/.claw`，必须独立于项目上下文根目录，请保护其写权限。
+- 项目未信任时，普通 AGENTS/同层 override 仍可加载并影响模型；这意味着**未信任不等于不接受仓库指令**。项目 `.claw/SYSTEM.md`、`.claw/APPEND_SYSTEM.md`、`.claw/skills/` 不读取、不解析，发现时明确告警，并提示 `claw trust`。
+- 信任时加载上述项目资源。Project SYSTEM > User SYSTEM > Builtin Core；Append 为 User → Project。SYSTEM 仅替换 core，动态 tools/rules/runtime/plan 不被替换；Explorer 的只读运行时角色保留，但任意自定义指令仍可能语义冲突，实际只读由 Registry/Executor 强制。
+- `claw trust [status|revoke] [-workdir path]` 按 canonical Git root 精确授权；非 Git 使用 canonical WorkDir。Linked Worktree 的 Git file 仅作为本 worktree 边界，不跳转或执行 Git 配置/hook，不隐式授权其他 worktree。没有按字符串前缀继承的 trust，也没有内容签名、逐文件批准或变更后自动撤销；同路径换仓库仍会保留授权，删除/替换项目应先 revoke。
+- `<CLAW_HOME>/trusted-projects.json` 为 0600 普通文件，拒绝 symlink/非普通文件，损坏/不可读时 fail closed 并告警，绝不默认为 trusted。保存采用现有私密临时文件、sync/close、原子 rename。更新通过 `.lock` 目录串行 read-modify-write，锁冲突拒绝；进程崩溃可遗留 lock，仅确认无 trust 命令运行后清理。此锁是合作进程的一致性保护，不是防同一 OS 用户篡改的安全边界。
+
+Context 从 WorkDir 向上止于最近 `.git` 标记，无标记仅加载 WorkDir。用户规则另行加载，不从 `/` 的任意父级读取 AGENTS。相同目录 override 优先，损坏不 fallback；canonical path 去重，Context file symlink 必须留在用户 Home / Git Root 对应作用域内。Skills 只发现当前 WorkDir 的 `.claw/skills/`，canonical location 必须落在 WorkDir 内；内部文件 symlink 可用，外部拒绝，嵌套目录 symlink 不遍历。Skill location 是宿主路径，额外 `read_path` 是现有 `read_file` 可用的工作区相对路径；相对引用仍不得越过工具安全边界。没有额外的 workspace 外读取白名单，也不添加 load_skill 工具。
+
+AGENTS/SYSTEM/APPEND 单文件读取限制为 1 MiB；AGENTS 失败告警并跳过，存在的 SYSTEM/APPEND 失败为 Error，阻止继续用默认 Core 假装成功。Skill 只解析至多 16 KiB 的 YAML header，name/description 必填且限长；坏 Skill 跳过、同名先有效路径优先，后续告警，不中止整个 Agent。正文按需读入后仍属于完整 Tool Output，可能消耗 Token Budget/Session 磁盘；lazy loading 不是 IO/磁盘 quota。canonicalization 也不是原子文件系统隔离，不能抵御恶意并发 symlink/rename/hardlink 操纵。
+
+Section 使用固定名称与边界，资源文本转义防止**格式层面**跨 Section 拼接，保留 Markdown 换行；转义不能阻止语义 Prompt Injection。每次 Run/Resume 重新检查资源与 Trust；单次运行内不热更新，revoke 不取消正在执行的任务，也不从已有历史删除已读取的 Skill 内容。
+
+观测仅记录 Section 名称、SHA256 和 count/token metrics，不记录完整 System Prompt。`claw prompt show` 仅列来源路径与大小，仍可能泄露项目路径；`claw prompt render` 明确警告并显式打印正文，可能包含项目/用户敏感信息，不要上传日志或分享。资源按需读取后依然可能进入 Session 与现有 Tool Trace preview；上述隐私边界不提供加密、自动秘密检测或日志净化。
 
 ## Dynamic OpenAI Registration / Host ID
 
@@ -135,7 +157,7 @@ docker rm --force <container-name>
 
 `IsDangerousCommand` 是 **Human Approval Layer** 的启发式规则，不是 **Security Boundary**。复杂 shell 表达式可能绕过正则。人工审批允许的是“在既定 Sandbox 权限内执行”，不是解除 RO、网络或资源限制。
 
-Prompt、AGENTS.md 和 Skills 同样不是安全边界。飞书远程接入还需要身份与访问控制、聊天作用域、审批权限和数据管理，不应在公开远程服务中启用 Local。
+Prompt、AGENTS.md、SYSTEM.md、APPEND_SYSTEM.md 和 Skills 同样不是安全边界，Project Trust 也不授予任何 Sandbox 之外的权限。飞书远程接入还需要身份与访问控制、聊天作用域、审批权限和数据管理，不应在公开远程服务中启用 Local。
 
 ## 验证与后续范围
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/ketitongxue/go-tiny-claw/internal/app"
 	"github.com/ketitongxue/go-tiny-claw/internal/config"
+	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/eval"
 	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 )
@@ -84,5 +85,6 @@ func main() {
 		log.Fatal(err)
 	}
 	runner := eval.NewBenchmarkRunner(p, info, string(authInfo.Type), exec)
+	runner.Prompts = ctxpkg.PromptService{Resources: ctxpkg.ResourceLoader{Home: paths.Home}, Language: runtime.Config.Language}
 	runner.RunSuite(ctx, testcases)
 }

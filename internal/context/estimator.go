@@ -30,6 +30,8 @@ func estimateText(text string) int {
 	}
 	return (quarters + 3) / 4
 }
+func (HeuristicEstimator) EstimateText(text string) int { return estimateText(text) }
+
 func (HeuristicEstimator) EstimateMessage(m schema.Message) int {
 	n := 8 + estimateText(string(m.Role)) + estimateText(m.Content) + estimateText(m.ToolCallID)
 	for _, c := range m.ToolCalls {

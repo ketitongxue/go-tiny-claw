@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"unicode"
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/fileutil"
@@ -14,6 +15,7 @@ const FallbackModel = "zai-coding-cn/glm-5.3"
 
 type Config struct {
 	DefaultModel string               `json:"default_model"`
+	Language     string               `json:"language,omitempty"`
 	Context      ctxpkg.ContextPolicy `json:"context,omitempty"`
 }
 
@@ -26,6 +28,9 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return c, err
 	}
+	if err := validateLanguage(c.Language); err != nil {
+		return c, err
+	}
 	if c.Context.DefaultContextWindow < 0 || c.Context.DefaultReservedOutput < 0 || c.Context.MaxToolResultTokens < 0 || c.Context.SafetyMarginPercent < 0 || c.Context.SafetyMarginPercent >= 100 {
 		return c, errors.New("invalid context policy")
 	}
@@ -34,7 +39,17 @@ func Load(path string) (Config, error) {
 	}
 	return c, err
 }
+func validateLanguage(language string) error {
+	if len(language) > 64 || strings.IndexFunc(language, unicode.IsControl) >= 0 {
+		return errors.New("invalid response language")
+	}
+	return nil
+}
+
 func Save(path string, c Config) error {
+	if err := validateLanguage(c.Language); err != nil {
+		return err
+	}
 	if _, err := provider.ParseModelRef(c.DefaultModel); err != nil {
 		return err
 	}

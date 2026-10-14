@@ -5,20 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ketitongxue/go-tiny-claw/internal/agenthome"
 )
 
 // AgentHomeDir is the global, non-workspace configuration directory.
 // CLAW_HOME is an explicit override, also useful for isolated tests.
-func AgentHomeDir() (string, error) {
-	if dir := os.Getenv("CLAW_HOME"); dir != "" {
-		return filepath.Abs(dir)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, ".claw"), nil
-}
+func AgentHomeDir() (string, error) { return agenthome.Dir() }
 
 type Paths struct{ Home, Config, Auth, Models, Host, OpenAIModels, Sessions string }
 

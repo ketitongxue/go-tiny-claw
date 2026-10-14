@@ -2,7 +2,9 @@ package feishu
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
@@ -21,7 +23,11 @@ func (p resumeProvider) Generate(ctx context.Context, m []schema.Message, d []sc
 func TestFeishuRestartResumeWithPinnedModelAndContext(t *testing.T) {
 	t.Setenv("FEISHU_APP_ID", "cli_test")
 	t.Setenv("FEISHU_APP_SECRET", "test")
-	dir := t.TempDir()
+	dir, home := t.TempDir(), t.TempDir()
+	t.Setenv("CLAW_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "AGENTS.md"), []byte("INITIAL USER CONTEXT"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	store, err := sessionstore.NewFileStore(filepath.Join(t.TempDir(), "sessions"))
 	if err != nil {
 		t.Fatal(err)
@@ -50,18 +56,26 @@ func TestFeishuRestartResumeWithPinnedModelAndContext(t *testing.T) {
 	if err := a.handleMessage(ctx, textEvent("chat", "1", "first task")); err != nil {
 		t.Fatal(err)
 	}
-	receive(t, seen)
+	if messages := receive(t, seen); !strings.Contains(messages[0].Content, "INITIAL USER CONTEXT") {
+		t.Fatal("user context not loaded")
+	}
 	if receive(t, refs) != "fake/model-a" {
 		t.Fatal("wrong initial model")
 	}
 	a.Close()
 	a.workers.Wait()
+	if err := os.WriteFile(filepath.Join(home, "AGENTS.md"), []byte("UPDATED USER CONTEXT"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	b := start("model-b")
 	defer func() { b.Close(); b.workers.Wait() }()
 	if err := b.handleMessage(ctx, textEvent("chat", "2", "continue")); err != nil {
 		t.Fatal(err)
 	}
 	messages := receive(t, seen)
+	if !strings.Contains(messages[0].Content, "UPDATED USER CONTEXT") || strings.Contains(messages[0].Content, "INITIAL USER CONTEXT") {
+		t.Fatal("Feishu resume retained stale prompt")
+	}
 	if receive(t, refs) != "fake/model-a" {
 		t.Fatal("default replaced pinned model")
 	}

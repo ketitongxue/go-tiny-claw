@@ -40,6 +40,7 @@ type options struct {
 	modelInfo                            provider.ModelInfo
 	authType                             string
 	contextPolicy                        ctxpkg.ContextPolicy
+	promptHome, language                 string
 }
 
 func parseOptions(args []string, output io.Writer) (options, error) {
@@ -116,17 +117,7 @@ type sessionExecutors struct {
 
 // 每个聊天分别装配引擎、计费器和审批闭包，避免上下文、失败计数与账单串线。
 func newSessionEngine(p provider.LLMProvider, sess *ctxpkg.Session, reporter engine.Reporter, opts options, executors sessionExecutors) *engine.AgentEngine {
-	registry := tools.NewRegistry()
-	registry.Register(tools.NewReadFileTool(sess.WorkDir))
-	registry.Register(tools.NewWriteFileTool(sess.WorkDir))
-	registry.Register(tools.NewBashTool(sess.WorkDir, executors.coding, executor.CodingPolicy()))
-	registry.Register(tools.NewEditFileTool(sess.WorkDir))
-
-	explorerRegistry := tools.NewRegistry()
-	explorerRegistry.Register(tools.NewReadFileTool(sess.WorkDir))
-	if executors.explorer != nil {
-		explorerRegistry.Register(tools.NewBashTool(sess.WorkDir, executors.explorer, executor.ExplorerPolicy()))
-	}
+	registry, explorerRegistry := newToolRegistries(sess.WorkDir, executors)
 
 	if opts.mode == "feishu" {
 		middleware := func(ctx context.Context, call schema.ToolCall) (bool, string) {
@@ -146,10 +137,35 @@ func newSessionEngine(p provider.LLMProvider, sess *ctxpkg.Session, reporter eng
 	tracked := observability.NewCostTracker(p, opts.modelInfo, sess)
 	sess.SetAuthType(opts.authType)
 	eng := engine.NewAgentEngine(tracked, registry, opts.thinking, opts.plan)
+	eng.Prompts = ctxpkg.PromptService{Resources: ctxpkg.ResourceLoader{Home: opts.promptHome}, Language: opts.language}
 	eng.ContextBuilder = ctxpkg.NewContextBuilder(opts.contextPolicy)
 	eng.ContextSpec = ctxpkg.ModelContextSpec{ContextWindow: opts.modelInfo.ContextWindow, MaxOutput: opts.modelInfo.MaxOutput}
 	registry.Register(tools.NewSubagentTool(eng, explorerRegistry, reporter))
 	return eng
+}
+
+// Shared by live sessions and offline prompt inspection, so tool selection and
+// prompt metadata cannot silently drift. Subagent binding happens after wiring.
+func newToolRegistries(workDir string, executors sessionExecutors) (tools.Registry, tools.Registry) {
+	return newMainToolRegistry(workDir, executors.coding), newExplorerToolRegistry(workDir, executors.explorer)
+}
+
+func newMainToolRegistry(workDir string, exec executor.Executor) tools.Registry {
+	registry := tools.NewRegistry()
+	registry.Register(tools.NewReadFileTool(workDir))
+	registry.Register(tools.NewWriteFileTool(workDir))
+	registry.Register(tools.NewBashTool(workDir, exec, executor.CodingPolicy()))
+	registry.Register(tools.NewEditFileTool(workDir))
+	return registry
+}
+
+func newExplorerToolRegistry(workDir string, exec executor.Executor) tools.Registry {
+	registry := tools.NewRegistry()
+	registry.Register(tools.NewReadFileTool(workDir))
+	if exec != nil {
+		registry.Register(tools.NewBashTool(workDir, exec, executor.ExplorerPolicy()))
+	}
+	return registry
 }
 
 const localExecutorWarning = `WARNING: 当前 Bash 使用宿主机 LocalExecutor（UNSAFE）。
@@ -211,6 +227,7 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 		return err
 	}
 	opts.contextPolicy = runtime.Config.Context
+	opts.promptHome, opts.language = runtime.Paths.Home, runtime.Config.Language
 	store, err := sessionstore.NewFileStore(runtime.Paths.Sessions)
 	if err != nil {
 		return err
@@ -271,6 +288,15 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	}
 	if err := os.MkdirAll(opts.workDir, 0o755); err != nil {
 		return fmt.Errorf("创建工作区失败: %w", err)
+	}
+	// Discover warnings before serving Feishu or contacting a model. Runtime
+	// prompt builds still reload resources so later trust/revocation is observed.
+	resources, err := (ctxpkg.ResourceLoader{Home: runtime.Paths.Home}).Load(opts.workDir)
+	for _, d := range resources.Diagnostics {
+		fmt.Fprintf(output, "[Prompt] %s: %s: %s\n", d.Level, d.Path, d.Message)
+	}
+	if err != nil {
+		return err
 	}
 	executors, err := configureExecutors(ctx, opts, output)
 	if err != nil {

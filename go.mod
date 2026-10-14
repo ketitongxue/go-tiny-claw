@@ -7,6 +7,7 @@ require (
 	github.com/larksuite/oapi-sdk-go/v3 v3.9.10
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.34.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
