@@ -111,23 +111,23 @@ func TestBashSuccessfulStderrIsNotFailure(t *testing.T) {
 	}
 }
 
-func TestBashFailureOutputLimitKeepsStderrAndExitCode(t *testing.T) {
+func TestBashFailureKeepsCompleteStreamsAndExitCode(t *testing.T) {
 	registry := NewRegistry()
 	registry.Register(NewBashTool("unused", executorFunc(func(context.Context, executor.Request, executor.OutputHandler) (executor.Result, error) {
 		return executor.Result{ExitCode: 1, Stdout: strings.Repeat("中", 10000), Stderr: "important error"}, nil
 	}), executor.CodingPolicy()))
 	result := registry.Execute(context.Background(), schema.ToolCall{Name: "bash", Arguments: json.RawMessage(`{"command":"generate output"}`)})
-	if !result.IsError || len(result.Output) > maxBashOutputBytes || !utf8.ValidString(result.Output) || !strings.Contains(result.Output, "important error") || !strings.Contains(result.Output, "code 1") {
+	if !result.IsError || !strings.Contains(result.Output, strings.Repeat("中", 10000)) || !utf8.ValidString(result.Output) || !strings.Contains(result.Output, "important error") || !strings.Contains(result.Output, "code 1") {
 		t.Fatalf("result=%+v", result)
 	}
 }
 
-func TestBashSuccessOutputLimit(t *testing.T) {
+func TestBashSuccessKeepsCompleteOutput(t *testing.T) {
 	tool := NewBashTool("unused", executorFunc(func(context.Context, executor.Request, executor.OutputHandler) (executor.Result, error) {
 		return executor.Result{Stdout: strings.Repeat("中", 10000), ExitCode: 0}, nil
 	}), executor.CodingPolicy())
 	output, err := tool.Execute(context.Background(), json.RawMessage(`{"command":"generate output"}`))
-	if err != nil || len(output) > maxBashOutputBytes || !strings.Contains(output, "已截断") {
+	if err != nil || output != strings.Repeat("中", 10000) {
 		t.Fatalf("output length=%d error=%v", len(output), err)
 	}
 }

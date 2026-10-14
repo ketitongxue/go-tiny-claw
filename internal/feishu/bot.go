@@ -36,6 +36,7 @@ type agentRunner interface {
 }
 
 type chatWorker struct {
+	chatID   string
 	session  *ctxpkg.Session
 	reporter *FeishuReporter
 	queue    chan string
@@ -44,19 +45,36 @@ type chatWorker struct {
 // FeishuBot owns one ordered conversation and one engine per chat.
 // Factories must construct independent, session-scoped engine dependencies.
 type FeishuBot struct {
-	client     *lark.Client
-	appID      string
-	appSecret  string
-	workDir    string
-	factory    func(*ctxpkg.Session, engine.Reporter) agentRunner
-	ctx        context.Context
-	cancel     context.CancelFunc
-	mu         sync.Mutex
-	chats      map[string]*chatWorker
-	seen       map[string]time.Time
-	workers    sync.WaitGroup
-	startupErr error
-	botOpenID  string // protected by mu; empty disables normal group tasks
+	resolveSession func(context.Context, string) (*ctxpkg.Session, error)
+	runtimeFactory func(context.Context, *ctxpkg.Session, engine.Reporter) (*engine.AgentEngine, error)
+	client         *lark.Client
+	appID          string
+	appSecret      string
+	workDir        string
+	factory        func(*ctxpkg.Session, engine.Reporter) agentRunner
+	ctx            context.Context
+	cancel         context.CancelFunc
+	mu             sync.Mutex
+	chats          map[string]*chatWorker
+	seen           map[string]time.Time
+	workers        sync.WaitGroup
+	startupErr     error
+	botOpenID      string // protected by mu; empty disables normal group tasks
+}
+
+// NewFeishuBotWithSessions performs disk/auth work in per-chat workers, never
+// under the bot-wide queue lock.
+func NewFeishuBotWithSessions(workDir string, resolve func(context.Context, string) (*ctxpkg.Session, error), factory func(context.Context, *ctxpkg.Session, engine.Reporter) (*engine.AgentEngine, error)) (*FeishuBot, error) {
+	if resolve == nil || factory == nil {
+		return nil, errors.New("session runtime factory required")
+	}
+	b, err := newFeishuBot(workDir, func(*ctxpkg.Session, engine.Reporter) agentRunner { return nil })
+	if err != nil {
+		return nil, err
+	}
+	b.resolveSession = resolve
+	b.runtimeFactory = factory
+	return b, nil
 }
 
 func NewFeishuBotWithFactory(workDir string, factory func(*ctxpkg.Session, engine.Reporter) *engine.AgentEngine) (*FeishuBot, error) {
@@ -399,6 +417,7 @@ func (b *FeishuBot) handleMessage(_ context.Context, event *larkim.P2MessageRece
 	worker := b.chats[chatID]
 	if worker == nil {
 		worker = &chatWorker{
+			chatID:   chatID,
 			session:  ctxpkg.NewSession(chatID, b.workDir),
 			reporter: &FeishuReporter{client: b.client, chatId: chatID, ctx: b.ctx},
 			queue:    make(chan string, chatQueueSize),
@@ -452,13 +471,33 @@ func (b *FeishuBot) runChat(worker *chatWorker) {
 				return
 			}
 			if runner == nil {
-				runner = b.factory(worker.session, worker.reporter)
+				if b.resolveSession != nil {
+					sess, err := b.resolveSession(b.ctx, worker.chatID)
+					if err != nil {
+						worker.reporter.OnMessage(b.ctx, fmt.Sprintf("❌ Session 恢复失败: %v", err))
+						continue
+					}
+					worker.session = sess
+				}
+				if b.runtimeFactory != nil {
+					eng, err := b.runtimeFactory(b.ctx, worker.session, worker.reporter)
+					if err != nil {
+						worker.reporter.OnMessage(b.ctx, fmt.Sprintf("❌ 模型不可用，请检查模型或重新登录: %v", err))
+						continue
+					}
+					runner = eng
+				} else {
+					runner = b.factory(worker.session, worker.reporter)
+				}
 			}
 			if runner == nil {
 				worker.reporter.OnMessage(b.ctx, "❌ 无法创建会话引擎")
 				continue
 			}
-			worker.session.Append(schema.Message{Role: schema.RoleUser, Content: prompt})
+			if err := worker.session.Append(schema.Message{Role: schema.RoleUser, Content: prompt}); err != nil {
+				worker.reporter.OnMessage(b.ctx, fmt.Sprintf("❌ Session 保存失败: %v", err))
+				continue
+			}
 			if err := runner.Run(b.ctx, worker.session, worker.reporter); err != nil && b.ctx.Err() == nil {
 				worker.reporter.OnMessage(b.ctx, fmt.Sprintf("❌ Agent 运行失败: %v", err))
 			}

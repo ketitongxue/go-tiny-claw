@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/fileutil"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 )
@@ -12,7 +13,8 @@ import (
 const FallbackModel = "zai-coding-cn/glm-5.3"
 
 type Config struct {
-	DefaultModel string `json:"default_model"`
+	DefaultModel string               `json:"default_model"`
+	Context      ctxpkg.ContextPolicy `json:"context,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -23,6 +25,9 @@ func Load(path string) (Config, error) {
 	}
 	if err != nil {
 		return c, err
+	}
+	if c.Context.DefaultContextWindow < 0 || c.Context.DefaultReservedOutput < 0 || c.Context.MaxToolResultTokens < 0 || c.Context.SafetyMarginPercent < 0 || c.Context.SafetyMarginPercent >= 100 {
+		return c, errors.New("invalid context policy")
 	}
 	if c.DefaultModel != "" {
 		_, err = provider.ParseModelRef(c.DefaultModel)

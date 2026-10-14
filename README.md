@@ -53,15 +53,17 @@
 | Plan Mode                           | ✅ 可选        |
 | AGENTS.md                           | ✅           |
 | Skills                              | ✅           |
-| 上下文压缩                               | ✅           |
+| Token-aware Context                 | ✅           |
+| Old Char Compactor                  | ❌ removed   |
+| Feishu Auto Resume                  | ✅           |
 | Tool Recovery                       | ✅           |
 | 重复失败提醒                              | ✅           |
 | Token 统计                            | ✅           |
 | 调用耗时统计                              | ✅           |
 | JSON Trace                          | ✅           |
 | 自动化 Benchmark                       | ✅           |
-| Session 跨进程持久化                      | ❌           |
-| Session Resume CLI                  | ❌           |
+| Session 跨进程持久化                      | ✅           |
+| Session Resume CLI                  | ✅           |
 | Streaming LLM Response              | ❌           |
 | Git Checkpoint / Rollback           | ❌           |
 | 全局最大 Turn / Cost Budget             | ❌           |
@@ -92,7 +94,7 @@
          AGENTS.md  Skills   Plan
                      │
                      ▼
-                 Compactor
+              ContextBuilder
                      │
                      ▼
                  Provider
@@ -152,7 +154,8 @@ go-tiny-claw/
 │   ├── context/
 │   │   ├── session.go
 │   │   ├── composer.go
-│   │   ├── compactor.go
+│   │   ├── service.go
+│   │   ├── builder.go / policy.go / estimator.go
 │   │   ├── recovery.go
 │   │   └── skill.go
 │   │
@@ -1093,7 +1096,7 @@ TODO.md
 
 但需要注意：
 
-> 当前 Session 本身仍然只保存在内存中，Plan Mode 不等于完整的 Session Persistence。
+> Session 现在独立持久化；Plan Mode 仍是文件级任务续接，不替代完整对话历史。
 
 ---
 
@@ -1110,15 +1113,17 @@ Session 当前记录：
 - Completion Tokens
 - Cost
 
-Session History 当前仅存在内存。
+完整历史与累计 Usage 保存在全局 `~/.claw/sessions/<SHA256(SessionID)>.jsonl`，支持 `CLAW_HOME`。目录权限 0700，文件 0600，绝不默认放在 workspace 中。文件包含用户 Prompt、代码、Tool Output 和 Agent Response，属于 **Sensitive Local Data**，不要提交、公开或挂载给 Agent。
 
-进程退出后不会自动恢复：
-
-```text
-.claw/sessions/*.jsonl
+```bash
+claw -mode demo -prompt "阅读当前项目并记住 package 数量"
+claw sessions
+claw session show <session-id>  # 仅 Metadata / Usage，不打印聊天正文
+claw -mode demo -resume <session-id> -prompt "继续刚才的任务"
+claw session delete <session-id> # 只删 Session，不删代码、WorkDir 或 Trace
 ```
 
-这类持久化目前尚未实现。
+新 Demo 使用随机 ID；飞书按 ChatID 自动恢复。Resume 使用保存的 provider/model，不随默认模型改变。WorkDir 不存在会报错；凭据由现有 AuthManager 重新解析/刷新，Session 不保存任何认证 Token。一个 Agent Home 只应由一个运行进程使用（暂不支持跨进程并发修改同一 Session）。
 
 ---
 
@@ -1126,17 +1131,17 @@ Session History 当前仅存在内存。
 
 Agent 不会每轮无条件把完整 Session 全部发送给模型。
 
-当前会从最近历史构建 Working Memory，并避免把 Tool Call 链从中间截断。
+ContextBuilder 按 `context window - reserved output - safety margin` 计算 Input Budget，并计入 Tool Schema。优先使用模型元数据；未知时集中 fallback 为 32768 window / 4096 reserved output / 10% margin。保守 heuristic 区分 ASCII、CJK 和 JSON，计算 Content、Tool Name、Arguments 与 Call ID。
 
-同时使用 Compactor 对较旧或过长内容进行压缩和截断。
+只选择完整近期用户轮次；System 与当前 User 不截断，超预算明确报错。Tool Output 在请求视图内按 token 上限做 Unicode-safe Head + Marker + Tail，完整磁盘历史不变。单个当前轮次（包括完整工具链/临时 Thinking）仍超预算时明确失败，不生成非法输入。Thinking 仅用于当前 Action，不进入 Conversation 或 Trace 正文。
 
-这主要用于限制：
+`~/.claw/config.json` 可以增加：
 
-- 大型 Tool Output
-- 历史日志
-- 长上下文增长
+```json
+{"context":{"default_context_window":32768,"default_reserved_output":4096,"safety_margin_percent":10,"max_tool_result_tokens":4096}}
+```
 
-当前 Compactor 是规则式处理，并非真正的 Token-aware Memory System。
+正常裁剪只记录 Trace 的 `context.*` 指标，不打印内存告警。明确的 Provider context limit 最多以更保守窗口重建并重试一次。Main 与 Explorer 使用同一模型与策略；没有 Summary / Vector Memory。
 
 ---
 
@@ -1189,17 +1194,9 @@ ExitCode
 Duration
 ```
 
-发送给模型的输出最大约：
+工具完整输出进入 Session History；发送给模型的请求视图由 ContextBuilder 的 `max_tool_result_tokens` 限制，不再在工具内部按 8000 bytes 截断。
 
-```text
-8000 bytes
-```
-
-过长内容会截断。
-
-需要注意：
-
-> Executor 当前仍会在主进程内保存完整 stdout/stderr，因此模型侧 8 KB 截断不代表宿主内存也受到同样限制。
+> Executor 与 Session 仍在主进程内保存完整 stdout/stderr；Token Budget 不等于宿主内存或磁盘 quota。
 
 ---
 
@@ -1691,18 +1688,9 @@ docs/security.md
 
 目前仍有一些明确未完成的能力。
 
-## Session Persistence
+## Session / Context 限制
 
-Session 仅驻留内存。
-
-尚未实现：
-
-```text
-JSONL Session Store
-Session List
-Resume
-Fork
-```
+JSONL Session Store、List、Resume 与飞书自动恢复已实现。尚不支持 Fork、跨进程并发写入、云同步、磁盘加密、Summary Memory。Heuristic Token Estimator 不是官方 tokenizer；单个完整当前轮次无法装入 Budget 时会报错，未完成工具链不会自动重跑。
 
 ---
 
@@ -1767,8 +1755,8 @@ Task Deadline
 建议后续演进方向：
 
 ```text
-1. Session JSONL Persistence + Resume
-2. Git Checkpoint / Diff / Rollback
+1. Session JSONL Persistence + Resume（M5 已完成）
+2. Git Checkpoint / Diff / Rollback（等待人工验收，不自动开始）
 3. Task Verifier
 4. Streaming / Cancel / Steering
 5. Session-scoped Sandbox Container

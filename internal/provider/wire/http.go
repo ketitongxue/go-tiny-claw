@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -44,7 +45,18 @@ func Post(ctx context.Context, client *http.Client, endpoint string, headers map
 		return nil, errors.New("model HTTP request failed (transport error)")
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var reply struct {
+			Error struct {
+				Code string `json:"code"`
+				Type string `json:"type"`
+			} `json:"error"`
+		}
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		_ = json.Unmarshal(data, &reply)
 		resp.Body.Close()
+		if reply.Error.Code == "context_length_exceeded" || reply.Error.Type == "context_length_exceeded" {
+			return nil, errors.New("model context_length_exceeded")
+		}
 		// Do not echo arbitrary server bodies: gateways can echo Authorization.
 		return nil, fmt.Errorf("model HTTP request failed (status %d)", resp.StatusCode)
 	}

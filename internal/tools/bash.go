@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
@@ -75,7 +74,7 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		err := fmt.Errorf("command exited with code %d", result.ExitCode)
 		return bashFailureOutput(fmt.Sprintf("Command exited with code %d", result.ExitCode), result), err
 	}
-	return limitBashOutput(bashOutput(result)), nil
+	return bashOutput(result), nil
 }
 
 func bashOutput(result executor.Result) string {
@@ -85,40 +84,14 @@ func bashOutput(result executor.Result) string {
 	if result.Stderr == "" {
 		return result.Stdout
 	}
-	return bashStreams(result, maxBashOutputBytes)
+	return bashStreams(result)
 }
-
-const maxBashOutputBytes = 8000
 
 func bashFailureOutput(status string, result executor.Result) string {
-	status = limitBashText(status, 1024)
-	return status + "\n\n" + bashStreams(result, maxBashOutputBytes-len(status)-2)
+	return status + "\n\n" + bashStreams(result)
 }
 
-// Budget both streams so a large stdout cannot hide stderr or the exit status.
-func bashStreams(result executor.Result, budget int) string {
-	remaining := budget - len("STDOUT:\n\nSTDERR:\n")
-	stdoutBudget := remaining / 2
-	stderrBudget := remaining - stdoutBudget
-	if len(result.Stdout) < stdoutBudget {
-		stderrBudget += stdoutBudget - len(result.Stdout)
-	} else if len(result.Stderr) < stderrBudget {
-		stdoutBudget += stderrBudget - len(result.Stderr)
-	}
-	return fmt.Sprintf("STDOUT:\n%s\nSTDERR:\n%s", limitBashText(result.Stdout, stdoutBudget), limitBashText(result.Stderr, stderrBudget))
-}
-
-func limitBashOutput(output string) string { return limitBashText(output, maxBashOutputBytes) }
-
-// The truncation marker is included in the budget, including on failure paths.
-func limitBashText(output string, budget int) string {
-	if len(output) <= budget {
-		return output
-	}
-	const marker = "\n\n...[终端输出过长，已截断]..."
-	end := budget - len(marker)
-	for end > 0 && !utf8.RuneStart(output[end]) {
-		end--
-	}
-	return output[:end] + marker
+// Preserve both complete streams in history. Request limits belong to ContextBuilder.
+func bashStreams(result executor.Result) string {
+	return fmt.Sprintf("STDOUT:\n%s\nSTDERR:\n%s", result.Stdout, result.Stderr)
 }

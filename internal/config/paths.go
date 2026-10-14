@@ -20,7 +20,7 @@ func AgentHomeDir() (string, error) {
 	return filepath.Join(home, ".claw"), nil
 }
 
-type Paths struct{ Home, Config, Auth, Models, Host, OpenAIModels string }
+type Paths struct{ Home, Config, Auth, Models, Host, OpenAIModels, Sessions string }
 
 func NewPaths(home string) (Paths, error) {
 	if strings.TrimSpace(home) == "" {
@@ -30,7 +30,7 @@ func NewPaths(home string) (Paths, error) {
 	if err != nil {
 		return Paths{}, err
 	}
-	return Paths{Home: home, Config: filepath.Join(home, "config.json"), Auth: filepath.Join(home, "auth.json"), Models: filepath.Join(home, "models.json"), Host: filepath.Join(home, "host.json"), OpenAIModels: filepath.Join(home, "openai-models.json")}, nil
+	return Paths{Sessions: filepath.Join(home, "sessions"), Home: home, Config: filepath.Join(home, "config.json"), Auth: filepath.Join(home, "auth.json"), Models: filepath.Join(home, "models.json"), Host: filepath.Join(home, "host.json"), OpenAIModels: filepath.Join(home, "openai-models.json")}, nil
 }
 
 // Refuse broad workspaces that would expose the global credential directory.

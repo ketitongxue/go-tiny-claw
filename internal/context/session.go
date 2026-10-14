@@ -1,6 +1,8 @@
 package context
 
 import (
+	stdctx "context"
+	"github.com/ketitongxue/go-tiny-claw/internal/sessionstore"
 	"sync"
 	"time"
 
@@ -27,6 +29,7 @@ type Session struct {
 	Currency              string
 
 	// 存放此 Session 中所有的用户输入、大模型回复和工具调用结果
+	store   sessionstore.Store
 	history []schema.Message
 	mu      sync.RWMutex // 读写锁，防止并发读写历史时发生 Data Race
 }
@@ -43,6 +46,10 @@ func (u UsageTotals) Billing() provider.UsageBilling {
 	return provider.UsageBilling{Mode: u.BillingMode, EstimatedCost: u.EstimatedCost, CostKnown: u.CostKnown, Currency: u.Currency}
 }
 func (s *Session) SetModelInfo(model provider.ModelInfo) {
+	// Durable model identity is pinned at creation, not reselected by trackers.
+	if s.store != nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ProviderID = model.ProviderID
@@ -57,6 +64,9 @@ func (s *Session) SetModelInfo(model provider.ModelInfo) {
 	}
 }
 func (s *Session) SetAuthType(authType string) {
+	if s.store != nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.AuthType = authType
@@ -66,17 +76,31 @@ func (s *Session) ModelAttributes() map[string]string {
 	defer s.mu.RUnlock()
 	return map[string]string{"provider_id": s.ProviderID, "model_id": s.ModelID, "billing_mode": string(s.BillingMode), "auth_type": s.AuthType}
 }
-func (s *Session) RecordUsage(prompt int, completion int, billing provider.UsageBilling) {
+func (s *Session) RecordUsage(prompt int, completion int, billing provider.UsageBilling) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.TotalPromptTokens += prompt
-	s.TotalCompletionTokens += completion
-	s.CostKnown = s.CostKnown && billing.CostKnown
+	u := s.usageLocked()
+	u.PromptTokens += prompt
+	u.CompletionTokens += completion
+	u.CostKnown = u.CostKnown && billing.CostKnown
 	if billing.CostKnown {
-		s.TotalEstimatedCost += billing.EstimatedCost
+		u.EstimatedCost += billing.EstimatedCost
 	}
+	e := sessionstore.NewEvent("usage")
+	e.Usage = &u
+	if s.store != nil {
+		if err := s.store.Append(stdctx.Background(), s.ID, e); err != nil {
+			return err
+		}
+	}
+	s.TotalPromptTokens = u.PromptTokens
+	s.TotalCompletionTokens = u.CompletionTokens
+	s.TotalEstimatedCost = u.EstimatedCost
+	s.CostKnown = u.CostKnown
+	s.UpdatedAt = e.Timestamp
+	return nil
 }
-func (s *Session) MarkCostUnknown() { s.mu.Lock(); defer s.mu.Unlock(); s.CostKnown = false }
+func (s *Session) MarkCostUnknown() error { return s.RecordUsage(0, 0, provider.UsageBilling{}) }
 func (s *Session) UsageSnapshot() UsageTotals {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -102,15 +126,24 @@ func NewSession(id string, workDir string) *Session {
 }
 
 // Append 线程安全地向 Session 中追加消息
-func (s *Session) Append(msgs ...schema.Message) {
+func (s *Session) Append(msgs ...schema.Message) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.history = append(s.history, msgs...)
+	events := make([]sessionstore.Event, len(msgs))
+	for i := range msgs {
+		events[i] = sessionstore.NewEvent("message")
+		events[i].Message = &msgs[i]
+	}
+	if s.store != nil {
+		if err := s.store.Append(stdctx.Background(), s.ID, events...); err != nil {
+			return err
+		}
+	}
+	// Own the data: tool arguments and usage pointers must not alias callers.
+	copyMsgs := cloneMessages(msgs)
+	s.history = append(s.history, copyMsgs...)
 	s.UpdatedAt = time.Now()
-
-	// 【持久化预留点】：在真实的工业级实现中（如 Claude Code），
-	// 我们会在这里将 s.history 以 JSONL 的格式 Append 到 workDir/.claw/sessions/xxx.jsonl 中。
-	// s.SaveToDisk()
+	return nil
 }
 
 // GetWorkingMemory 是驾驭工程的核心！
@@ -131,7 +164,7 @@ func (s *Session) GetWorkingMemory(limit int) []schema.Message {
 
 	// 需要深拷贝顶层切片，避免调用方修改 Session 的底层历史数组。
 	res := make([]schema.Message, total-start)
-	copy(res, s.history[start:])
+	copy(res, cloneMessages(s.history[start:]))
 	return res
 }
 
@@ -150,30 +183,4 @@ func (s *Session) findConversationStart(candidate int) int {
 
 	// 没有普通 User 消息时保留完整历史，避免继续制造孤儿工具消息。
 	return 0
-}
-
-// ==========================================
-// 全局 Session Manager: 用于多用户/多终端隔离
-// ==========================================
-
-type SessionManager struct {
-	sessions map[string]*Session
-	mu       sync.RWMutex
-}
-
-var GlobalSessionMgr = &SessionManager{
-	sessions: make(map[string]*Session),
-}
-
-// GetOrCreate 获取或创建一个会话
-func (sm *SessionManager) GetOrCreate(id string, workDir string) *Session {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
-	if sess, exists := sm.sessions[id]; exists {
-		return sess
-	}
-	sess := NewSession(id, workDir)
-	sm.sessions[id] = sess
-	return sess
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/ketitongxue/go-tiny-claw/internal/config"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider/openai"
+	"github.com/ketitongxue/go-tiny-claw/internal/sessionstore"
 	"golang.org/x/term"
 )
 
@@ -42,7 +43,7 @@ func loadRuntime() (*app.Runtime, error) {
 	return app.Load(paths, os.Getenv)
 }
 func dispatchCommand(ctx context.Context, args []string, cio commandIO) (bool, error) {
-	if len(args) == 0 || args[0] != "auth" && args[0] != "models" && args[0] != "model" {
+	if len(args) == 0 || args[0] != "auth" && args[0] != "models" && args[0] != "model" && args[0] != "sessions" && args[0] != "session" {
 		return false, nil
 	}
 	r, err := loadRuntime()
@@ -56,6 +57,37 @@ func runCommand(ctx context.Context, args []string, r *app.Runtime, cio commandI
 		return err
 	}
 	switch args[0] {
+	case "sessions", "session":
+		store, err := sessionstore.NewFileStore(r.Paths.Sessions)
+		if err != nil {
+			return err
+		}
+		if args[0] == "sessions" && len(args) == 1 {
+			list, err := store.List(ctx)
+			if err != nil {
+				return err
+			}
+			w := tabwriter.NewWriter(cio.output, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(w, "SESSION ID\tMODEL\tWORKDIR\tMESSAGES\tUPDATED")
+			for _, m := range list {
+				fmt.Fprintf(w, "%s\t%s/%s\t%s\t%d\t%s\n", m.ID, m.ProviderID, m.ModelID, m.WorkDir, m.Messages, m.UpdatedAt.Format(time.RFC3339))
+			}
+			return w.Flush()
+		}
+		if len(args) == 3 && args[0] == "session" {
+			if args[1] == "delete" {
+				return store.Delete(ctx, args[2])
+			}
+			if args[1] == "show" {
+				s, err := store.Load(ctx, args[2])
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(cio.output, "Session: %s\nModel: %s/%s\nWorkDir: %s\nMessages: %d\nUpdated: %s\nUsage: %+v\n", s.Metadata.ID, s.Metadata.ProviderID, s.Metadata.ModelID, s.Metadata.WorkDir, len(s.History), s.Metadata.UpdatedAt.Format(time.RFC3339), s.Usage)
+				return nil
+			}
+		}
+		return errors.New("usage: claw sessions | claw session show <id> | claw session delete <id>")
 	case "auth":
 		if len(args) < 2 {
 			return errors.New("usage: claw auth login [provider] | claw auth logout <provider>")
@@ -138,7 +170,7 @@ func runCommand(ctx context.Context, args []string, r *app.Runtime, cio commandI
 			if _, _, err := r.Manager.Inspect(ctx, ref); err != nil {
 				return err
 			}
-			if err := config.Save(r.Paths.Config, config.Config{DefaultModel: ref.String()}); err != nil {
+			if err := config.Save(r.Paths.Config, func() config.Config { c := r.Config; c.DefaultModel = ref.String(); return c }()); err != nil {
 				return err
 			}
 			fmt.Fprintf(cio.output, "Default model: %s\nSaved: %s\n", ref, r.Paths.Config)

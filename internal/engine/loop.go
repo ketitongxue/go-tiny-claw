@@ -19,8 +19,9 @@ type AgentEngine struct {
 	provider       provider.LLMProvider
 	registry       tools.Registry
 	EnableThinking bool
-	PlanMode       bool                    // 【新增】暴露给外部的计划模式开关
-	compactor      *ctxpkg.Compactor       // 【新增】压缩器实例
+	PlanMode       bool // 【新增】暴露给外部的计划模式开关
+	ContextBuilder *ctxpkg.ContextBuilder
+	ContextSpec    ctxpkg.ModelContextSpec
 	recovery       *ctxpkg.RecoveryManager // 【新增】自愈管理器
 	injector       *ReminderInjector       // 【新增】提醒注入器
 }
@@ -32,11 +33,9 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 		registry:       r,
 		EnableThinking: enableThinking,
 		PlanMode:       planMode,
-		// 【初始化压缩器】：为了便于今天的极端测试，我们将水位线阈值设积极（例如 3000 字符），
-		// 并保护最近的 6 条消息（大约两轮 Turn 的交互）
-		compactor: ctxpkg.NewCompactor(3000, 6),
-		recovery:  ctxpkg.NewRecoveryManager(), // 初始化 Recovery
-		injector:  NewReminderInjector(),       // 【初始化注入器】
+		ContextBuilder: ctxpkg.NewContextBuilder(ctxpkg.ContextPolicy{}),
+		recovery:       ctxpkg.NewRecoveryManager(), // 初始化 Recovery
+		injector:       NewReminderInjector(),       // 【初始化注入器】
 	}
 }
 
@@ -80,22 +79,12 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 
 		availableTools := e.registry.GetAvailableTools()
 
-		// 1. 【上下文组装】: System Prompt + 截取最近的 6 条消息作为 Working Memory
-		// 在实际业务中，由于工具返回结果可能很长，短期工作记忆往往设为 6-10 条足以维系连贯对话
-		workingMemory := session.GetWorkingMemory(20)
-
-		var contextHistory []schema.Message
-		contextHistory = append(contextHistory, systemMsg)
-		contextHistory = append(contextHistory, workingMemory...)
-
-		// 2. 【核心注入点】: 在向 Provider 发起推理前，过一遍内存压缩器！
-		// 无论你带出了多少上下文，如果字符总数超标，早期日志将被掩码化，超大日志将被掐头去尾
-		compactedContext := e.compactor.Compact(contextHistory)
-
-		// 记录发给模型的实际上下文大小，非常有助于排查幻觉
-		turnSpan.AddAttribute("context_message_count", len(compactedContext))
-
-		var currentTurnThinkingContent string
+		history := session.GetWorkingMemory(0)
+		built, err := e.buildContext(systemMsg, history, availableTools, turnSpan, e.ContextSpec)
+		if err != nil {
+			return err
+		}
+		compactedContext := built.Messages
 
 		// 3. 后续的 Provider.Generate 全面使用被保护过的新鲜上下文 (compactedContext)
 		// ================= Phase 1: Thinking =================
@@ -107,22 +96,36 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 			// 【埋点 3】：记录 Thinking 调用
 			thinkCtx, thinkSpan := observability.StartSpan(turnCtx, "LLM.Thinking")
 
-			thinkResp, err := e.provider.Generate(thinkCtx, compactedContext, nil)
-			thinkSpan.EndSpan() // 结束思考跨度
+			thinkResp, err := e.generate(thinkCtx, systemMsg, history, compactedContext, nil, thinkSpan)
+			if err != nil {
+				thinkSpan.AddAttribute("status", "error")
+			} else {
+				thinkSpan.AddAttribute("status", "ok")
+				if thinkResp.Usage != nil {
+					thinkSpan.AddAttribute("prompt_tokens", thinkResp.Usage.PromptTokens)
+					thinkSpan.AddAttribute("completion_tokens", thinkResp.Usage.CompletionTokens)
+				}
+			}
+			thinkSpan.EndSpan() // Metadata only; never record Thinking body.
 
 			if err != nil {
 				return fmt.Errorf("Thinking 阶段失败: %w", err)
 			}
 			if thinkResp.Content != "" {
-				currentTurnThinkingContent = thinkResp.Content
-				compactedContext = append(compactedContext, *thinkResp)
+				// Thinking is ephemeral: rebuild the Action view with it included.
+				history = append(history, *thinkResp)
+				built, err = e.buildContext(systemMsg, history, availableTools, turnSpan, e.ContextSpec)
+				if err != nil {
+					return err
+				}
+				compactedContext = built.Messages
 			}
 		}
 
 		// ================= Phase 2: Action =================
 		// 【埋点 4】：记录 Action 调用
 		actCtx, actSpan := observability.StartSpan(turnCtx, "LLM.Action")
-		actionResp, err := e.provider.Generate(actCtx, compactedContext, availableTools)
+		actionResp, err := e.generate(actCtx, systemMsg, history, compactedContext, availableTools, turnSpan)
 		actSpan.EndSpan() // 结束行动跨度
 
 		if err != nil {
@@ -132,12 +135,15 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		// (上一讲修复 1214 的关键代码：合并为合法的单条 Assistant 消息)
 		finalAssistantMsg := schema.Message{
 			Role:      schema.RoleAssistant,
-			Content:   strings.TrimSpace(currentTurnThinkingContent + "\n" + actionResp.Content),
+			Content:   strings.TrimSpace(actionResp.Content),
+			Usage:     actionResp.Usage,
 			ToolCalls: actionResp.ToolCalls,
 		}
 
 		// 将大模型的行动响应持久化到 Session 中
-		session.Append(finalAssistantMsg)
+		if err := session.Append(finalAssistantMsg); err != nil {
+			return err
+		}
 
 		if actionResp.Content != "" && reporter != nil {
 			reporter.OnMessage(ctx, actionResp.Content)
@@ -182,8 +188,8 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 
 				if reporter != nil {
 					displayOutput := finalOutput
-					if len(displayOutput) > 200 {
-						displayOutput = displayOutput[:200] + "... (已截断)"
+					if len([]rune(displayOutput)) > 200 {
+						displayOutput = string([]rune(displayOutput)[:200]) + "... (已截断)"
 					}
 					reporter.OnToolResult(ctx, call.Name, displayOutput, result.IsError)
 				}
@@ -205,7 +211,9 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		wg.Wait()
 
 		// 1. 先将所有的工具执行结果（Observation）持久化到 Session 中，开启下一轮的复盘与推理
-		session.Append(observationMsgs...)
+		if err := session.Append(observationMsgs...); err != nil {
+			return err
+		}
 
 		// 结束本轮 Turn 的 Span
 		turnSpan.EndSpan()
@@ -215,7 +223,9 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 		if reminderMsg != nil {
 			// 如果触发了干预规则，将这条严厉的提醒作为 User 消息，强制追加到 Session 的最末尾！
 			// 大模型在下一轮被唤醒时，第一眼就会看到这句话，从而打破局部执念。
-			session.Append(*reminderMsg)
+			if err := session.Append(*reminderMsg); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -261,10 +271,14 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 		// 【驾驭底线】：子智能体仅能获取传入的只读工具注册表
 		availableTools := readOnlyRegistry.GetAvailableTools()
 
-		compactedContext := e.compactor.Compact(contextHistory)
-
-		// 子任务要求急速响应，强制关闭主体的慢思考，直接预测行动
-		actionResp, err := e.provider.Generate(ctx, compactedContext, availableTools)
+		subCtx, span := observability.StartSpan(ctx, fmt.Sprintf("Subagent.Turn-%d", turnCount))
+		built, err := e.buildContext(contextHistory[0], contextHistory[1:], availableTools, span, e.ContextSpec)
+		if err != nil {
+			span.EndSpan()
+			return "", err
+		}
+		actionResp, err := e.generate(subCtx, contextHistory[0], contextHistory[1:], built.Messages, availableTools, span)
+		span.EndSpan()
 		if err != nil {
 			return "", fmt.Errorf("子智能体推理失败: %w", err)
 		}
@@ -302,8 +316,8 @@ func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyReg
 
 				if reporter != nil {
 					display := finalOutput
-					if len(display) > 200 {
-						display = display[:200] + "... (已截断)"
+					if len([]rune(display)) > 200 {
+						display = string([]rune(display)[:200]) + "... (已截断)"
 					}
 					r.OnToolResult(ctx, fmt.Sprintf("[Subagent] %s", call.Name), display, result.IsError)
 				}

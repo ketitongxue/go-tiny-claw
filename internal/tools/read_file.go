@@ -75,14 +75,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", fmt.Errorf("读取文件内容失败: %w", err)
 	}
 
-	// 4. 【核心防线】长度截断保护
-	// 为了防止大模型读取几百 MB 的日志文件导致 Context 瞬间爆炸 (OOM)，
-	// 我们在工具内部直接进行物理截断。
-	const maxLen = 8000
-	if len(content) > maxLen {
-		truncatedMsg := fmt.Sprintf("%s\n\n...[由于内容过长，已被系统截断至前 %d 字节]...", string(content[:maxLen]), maxLen)
-		return truncatedMsg, nil
-	}
+	// Complete facts enter Session; only ContextBuilder limits the request view.
 
 	return string(content), nil
 }

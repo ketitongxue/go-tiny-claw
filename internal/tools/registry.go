@@ -139,8 +139,8 @@ func (r *registryImpl) Execute(ctx context.Context, call schema.ToolCall) schema
 }
 
 func truncate(s string, max int) string {
-	if len(s) > max {
-		return s[:max] + "..."
+	if len([]rune(s)) > max {
+		return string([]rune(s)[:max]) + "..."
 	}
 	return s
 }

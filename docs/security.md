@@ -15,6 +15,16 @@
 
 以上是应用的数据流边界，不是对同一 OS 用户的强制文件隔离保证。**LocalExecutor 是 UNSAFE**，可主动读取宿主 `~/.claw/auth.json`；如果要让凭据与不可信 Agent 命令隔离，必须使用默认 Docker 后端，并确保工作区没有凭据副本、hardlink 或敏感挂载。
 
+## Session Store：Sensitive Local Data
+
+完整对话、用户 Prompt、代码内容、Tool Output、Agent Response 与累计 Usage 存在全局 `~/.claw/sessions/`（或 `CLAW_HOME/sessions`），**不放在 workspace**，也不默认挂载到 Docker。Agent Home / sessions 为 0700，JSONL 文件为 0600；Session ID 经 SHA256 映射到文件名，真实 ID 只保存在事件中。禁止提交、分享或复制到 workspace。LocalExecutor 仍可按宿主权限读取这些文件，权限不隔离同一 OS 用户。
+
+事件 schema v1 保存 session_created、完整 schema.Message、usage、metadata_updated；不保存 API Key 或 OAuth Access/Refresh/ID Token。模型 identity 固定，恢复只消费 ProviderManager / AuthManager 的解析与 refresh 能力。用户主动把秘密贴进 Prompt 或代码时，秘密仍可能进入对话记录；本模块不进行正文秘密检测或加密。
+
+Append / Usage 持久化失败会返回错误，不假装成功。尾部损坏 JSONL 记录可恢复，中间损坏明确拒绝；重建合法 Tool Chain 失败时拒绝推理。创建采用私密临时文件 + sync + 原子发布，追加按 Session 独立锁与 sync。仅支持同进程并发、单进程拥有 Store；不要运行多个进程同时修改同一 Session。崩溃在 Tool Call 与结果之间可能留下未完成链，当前拒绝恢复推理，不自动重跑有副作用的工具。
+
+ContextBuilder 的省略与截断仅是当前 Provider 请求视图，绝不回写历史。Thinking 正文默认不进入 Conversation / Trace。`session delete` 只删除 Session 文件，不能删除 WorkDir、代码、Trace，也不保证底层存储上的安全擦除；备份和 Trace 需独立管理。
+
 ## Dynamic OpenAI Registration / Host ID
 
 首次请求 `https://auth.openai.com/api/accounts/authorize` 使用入口 `dynamic_agent_client`、固定 `agent_name_hint=go-tiny-claw`、Host ID、PKCE、state、nonce，以及 OpenID/离线刷新/资源调用/Plan Usage scopes。先校验 callback state，再提取 code 和 issued client ID；缺少 issued ID 或返回入口 ID 即失败，**不会交换 token，也不能保存入口 ID**。Token exchange 为 `https://auth.openai.com/api/accounts/oauth/token`，使用 issued client ID，不发送 client secret。
@@ -90,7 +100,7 @@ Docker 不复制 `os.Environ()` 到容器。默认 `AllowedEnv` 是显式 Reques
 - **Docker runtime / 内核漏洞**：容器不是独立内核的 VM，不能承诺抵御容器逃逸。需维护和升级宿主、daemon 与可信镜像。
 - **整个 Agent 主进程**：Provider、read/write/edit 文件工具、会话、Trace 等仍在宿主执行；文件工具有 workspace 路径检查，但不是 OS Sandbox。此改动不将整个 Agent 容器化。
 - **宿主文件竞态与特殊文件关系**：canonicalization 和扫描不能原子锁定挂载源；并发重命名、symlink 变化、hardlink 与其他宿主进程可能扩大风险。不要允许不可信宿主用户并发操纵挂载源，也不要把宿主敏感文件 hardlink 到 workspace。
-- **宿主磁盘和完整输出内存**：workspace 的 RW 写入没有磁盘 quota；Executor 暂在主进程内保存完整 stdout/stderr。模型侧 8000 字节截断不等于宿主内存上限，大量输出仍可能造成主进程资源耗尽。
+- **宿主磁盘和完整输出内存**：workspace 的 RW 写入没有磁盘 quota；Executor 暂在主进程内保存完整 stdout/stderr。ContextBuilder 模型请求视图的 Token 截断不等于宿主内存上限，大量输出仍可能造成主进程资源耗尽。
 - **任务总成本与全局资源**：单命令限制不等于整个 Agent 的预算；多条并发命令叠加资源，主循环没有全局最大轮数和费用上限。
 - **数据外传到模型服务**：读取内容会进入 Provider 上下文，也可能留存在日志与 Trace；网络关闭只限制容器网络，不关闭主进程调用模型的网络。
 

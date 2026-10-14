@@ -38,7 +38,7 @@ func TestWorkingMemoryKeepsCompleteParallelToolTurn(t *testing.T) {
 	}
 }
 
-func TestCompactionPreservesToolReferencesAndLatestEvidence(t *testing.T) {
+func TestBuilderPreservesToolReferencesAndLatestEvidence(t *testing.T) {
 	oldOutput := strings.Repeat("old log ", 200)
 	latestOutput := "HEADER" + strings.Repeat("middle", 500) + "TRAILER"
 	msgs := []schema.Message{
@@ -49,7 +49,11 @@ func TestCompactionPreservesToolReferencesAndLatestEvidence(t *testing.T) {
 		{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: "latest", Name: "read_file", Arguments: json.RawMessage(`{"path":"latest"}`)}}},
 		{Role: schema.RoleUser, ToolCallID: "latest", Content: latestOutput},
 	}
-	got := NewCompactor(500, 2).Compact(msgs)
+	result, err := NewContextBuilder(ContextPolicy{MaxToolResultTokens: 500}).Build(msgs[0], msgs[1:], ModelContextSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.Messages
 	if len(got) != len(msgs) || got[0].Content != msgs[0].Content || got[1].Content != msgs[1].Content {
 		t.Fatalf("compaction altered message structure or instructions: %+v", got)
 	}

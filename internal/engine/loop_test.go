@@ -104,8 +104,8 @@ func TestRunPreservesThinkingParallelToolsAndTrace(t *testing.T) {
 				{ID: "call-b", Name: "read_file", Arguments: json.RawMessage(`{"path":"b"}`)},
 			}}, nil
 		case 4:
-			if msgs[2].Content != "thinking\nreading" || len(msgs[2].ToolCalls) != 2 {
-				return nil, errors.New("thinking/action were not merged into one assistant message")
+			if msgs[2].Content != "reading" || len(msgs[2].ToolCalls) != 2 {
+				return nil, errors.New("action history contaminated by thinking or missing tool calls")
 			}
 			if msgs[3].ToolCallID != "call-a" || msgs[4].ToolCallID != "call-b" {
 				return nil, errors.New("parallel tool results lost request order")
@@ -136,12 +136,17 @@ func TestRunPreservesThinkingParallelToolsAndTrace(t *testing.T) {
 	if calls != 4 || reporter.thinking != 2 || len(reporter.calls) != 2 || len(reporter.results) != 2 || len(reporter.messages) != 2 {
 		t.Fatalf("lost engine events: calls=%d reporter=%+v", calls, reporter)
 	}
+	for _, m := range session.GetWorkingMemory(0) {
+		if strings.Contains(m.Content, "thinking") {
+			t.Fatal("thinking persisted")
+		}
+	}
 	traces, err := filepath.Glob(filepath.Join(session.WorkDir, ".claw", "traces", "trace_chat-a_*.json"))
 	if err != nil || len(traces) != 1 {
 		t.Fatalf("expected one trace, got %v (%v)", traces, err)
 	}
 	data, err := os.ReadFile(traces[0])
-	if err != nil || !json.Valid(data) || !strings.Contains(string(data), "Tool.Execute") {
+	if err != nil || !json.Valid(data) || !strings.Contains(string(data), "Tool.Execute") || !strings.Contains(string(data), "context.input_budget_tokens") {
 		t.Fatalf("missing valid tool trace: %s (%v)", data, err)
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider/openai"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
+	"github.com/ketitongxue/go-tiny-claw/internal/sessionstore"
 	"github.com/ketitongxue/go-tiny-claw/internal/tools"
 )
 
@@ -33,11 +34,12 @@ const demoPrompt = `为了加快执行速度，请你在一轮回复中，【同
 请确保你是分别调用两个不同的工具，不要试图把它们合并成一个命令！`
 
 type options struct {
-	mode, workDir, model, prompt string
-	sandbox, sandboxImage        string
-	thinking, plan, checkConfig  bool
-	modelInfo                    provider.ModelInfo
-	authType                     string
+	mode, workDir, model, prompt, resume string
+	sandbox, sandboxImage                string
+	thinking, plan, checkConfig          bool
+	modelInfo                            provider.ModelInfo
+	authType                             string
+	contextPolicy                        ctxpkg.ContextPolicy
 }
 
 func parseOptions(args []string, output io.Writer) (options, error) {
@@ -47,6 +49,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	fs.StringVar(&opts.mode, "mode", "feishu", "运行模式：feishu（长连接）或 demo（原终端演示）")
 	fs.StringVar(&opts.workDir, "workdir", "workspace", "工具、会话、技能和 Trace 共用的工作区")
 	fs.StringVar(&opts.model, "model", "", "模型 provider/model；默认读取全局 config.json")
+	fs.StringVar(&opts.resume, "resume", "", "恢复已有 demo Session ID")
 	fs.StringVar(&opts.prompt, "prompt", demoPrompt, "demo 模式下执行的指令")
 	fs.StringVar(&opts.sandbox, "sandbox", executor.ModeAuto, "Bash 执行后端：auto（仅 Docker，失败拒绝启动）、docker、local（不安全）")
 	fs.StringVar(&opts.sandboxImage, "sandbox-image", executor.DefaultImage, "预先构建的 Docker Sandbox 镜像")
@@ -143,6 +146,8 @@ func newSessionEngine(p provider.LLMProvider, sess *ctxpkg.Session, reporter eng
 	tracked := observability.NewCostTracker(p, opts.modelInfo, sess)
 	sess.SetAuthType(opts.authType)
 	eng := engine.NewAgentEngine(tracked, registry, opts.thinking, opts.plan)
+	eng.ContextBuilder = ctxpkg.NewContextBuilder(opts.contextPolicy)
+	eng.ContextSpec = ctxpkg.ModelContextSpec{ContextWindow: opts.modelInfo.ContextWindow, MaxOutput: opts.modelInfo.MaxOutput}
 	registry.Register(tools.NewSubagentTool(eng, explorerRegistry, reporter))
 	return eng
 }
@@ -205,6 +210,24 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	opts.contextPolicy = runtime.Config.Context
+	store, err := sessionstore.NewFileStore(runtime.Paths.Sessions)
+	if err != nil {
+		return err
+	}
+	service := ctxpkg.NewSessionService(store)
+	var resumed *ctxpkg.Session
+	if opts.resume != "" {
+		if opts.mode != "demo" {
+			return errors.New("-resume 仅用于 demo；飞书自动恢复")
+		}
+		resumed, err = service.Resume(ctx, opts.resume)
+		if err != nil {
+			return err
+		}
+		opts.workDir = resumed.WorkDir
+		opts.model = resumed.ModelRef().String()
+	}
 	ref, legacy, err := config.ResolveSelectedModel(opts.model, runtime.Config)
 	if err != nil {
 		return err
@@ -222,7 +245,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		}
 	}
 	model, credentialInfo, err := runtime.Manager.Inspect(ctx, ref)
-	if err != nil {
+	if err != nil && (opts.mode != "feishu" || opts.checkConfig) {
 		return fmt.Errorf("所选/默认模型 %s 不可用: %w。请运行 claw auth login 或指定 -model", ref, err)
 	}
 	opts.modelInfo = model
@@ -252,15 +275,30 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	p, model, err := runtime.Manager.Create(ctx, ref)
-	if err != nil {
-		return err
+	factory := func(callCtx context.Context, sess *ctxpkg.Session, reporter engine.Reporter) (*engine.AgentEngine, error) {
+		if err := runtime.Paths.ValidateWorkspace(sess.WorkDir); err != nil {
+			return nil, err
+		}
+		p, m, err := runtime.Manager.Create(callCtx, sess.ModelRef())
+		if err != nil {
+			return nil, err
+		}
+		localOpts := opts
+		localOpts.modelInfo = m
+		return newSessionEngine(p, sess, reporter, localOpts, executors), nil
 	}
-	opts.modelInfo = model
 	if opts.mode == "feishu" {
-		bot, err := feishu.NewFeishuBotWithFactory(opts.workDir, func(sess *ctxpkg.Session, reporter engine.Reporter) *engine.AgentEngine {
-			return newSessionEngine(p, sess, reporter, opts, executors)
-		})
+		bot, err := feishu.NewFeishuBotWithSessions(opts.workDir, func(callCtx context.Context, id string) (*ctxpkg.Session, error) {
+			sess, err := service.Resume(callCtx, id)
+			if !errors.Is(err, sessionstore.ErrNotFound) {
+				return sess, err
+			}
+			selected, info, err := runtime.Manager.Inspect(callCtx, ref)
+			if err != nil {
+				return nil, err
+			}
+			return service.Create(callCtx, id, opts.workDir, selected, string(info.Type))
+		}, factory)
 		if err != nil {
 			return err
 		}
@@ -269,9 +307,25 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	}
 
 	reporter := engine.NewTerminalReporter()
-	sess := ctxpkg.NewSession("test_trace_001", opts.workDir)
-	eng := newSessionEngine(p, sess, reporter, opts, executors)
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: opts.prompt})
+	sess := resumed
+	if sess == nil {
+		id, err := ctxpkg.UniqueSessionID()
+		if err != nil {
+			return err
+		}
+		sess, err = service.Create(ctx, id, opts.workDir, model, opts.authType)
+		if err != nil {
+			return err
+		}
+	}
+	eng, err := factory(ctx, sess, reporter)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(output, "Session: %s | Model: %s\n", sess.ID, sess.ModelRef())
+	if err := sess.Append(schema.Message{Role: schema.RoleUser, Content: opts.prompt}); err != nil {
+		return err
+	}
 	log.Println("启动终端演示（含工具、子智能体、费用统计和 Tracing）")
 	if err := eng.Run(ctx, sess, reporter); err != nil {
 		return err

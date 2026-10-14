@@ -178,6 +178,8 @@ func (p *Provider) postOAuth(ctx context.Context, body any) (*http.Response, err
 }
 func subscriptionError(code string) error {
 	switch code {
+	case "context_length_exceeded":
+		return errors.New("model context_length_exceeded")
 	case "subscription_sharing_usage_limit_exceeded":
 		return errors.New("ChatGPT subscription usage limit exceeded (subscription_sharing_usage_limit_exceeded); wait for the plan quota to reset or explicitly configure an API key")
 	case "subscription_sharing_usage_unavailable":
