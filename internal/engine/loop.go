@@ -64,7 +64,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	}()
 
 	// 根据当前 Session 的工作区，动态组装最新的 System Prompt
-	state, err := e.Prompts.Build(session.WorkDir, nil, e.PlanMode, false)
+	state, err := e.Prompts.Build(session.WorkDir, tools.PromptMetadata(e.registry), e.PlanMode, false)
 	if err != nil {
 		return err
 	}
@@ -253,7 +253,7 @@ type promptWorkspaceKey struct{}
 func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyRegistry tools.Registry, reporter any) (string, error) {
 
 	workDir, _ := ctx.Value(promptWorkspaceKey{}).(string)
-	state, err := e.Prompts.Build(workDir, nil, false, true)
+	state, err := e.Prompts.Build(workDir, tools.PromptMetadata(readOnlyRegistry), false, true)
 	if err != nil {
 		return "", err
 	}

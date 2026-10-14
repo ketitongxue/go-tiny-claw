@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"github.com/ketitongxue/go-tiny-claw/internal/promptinfo"
+	"sort"
 	"strings"
 )
 
@@ -30,7 +32,7 @@ type ContextFile struct{ Path, Content, Scope string }
 
 type PromptInput struct {
 	Core                        string
-	ToolsText                   string
+	Tools                       []promptinfo.Tool
 	Guidelines                  []string
 	UserContext, ProjectContext []ContextFile
 	SkillsText                  string
@@ -56,9 +58,17 @@ func renderContext(files []ContextFile) string {
 	return strings.Join(parts, "\n")
 }
 func (c *PromptComposer) Compose(in PromptInput) (PromptState, error) {
+	metadata := append([]promptinfo.Tool(nil), in.Tools...)
+	sort.Slice(metadata, func(i, j int) bool { return metadata[i].Name < metadata[j].Name })
+	var toolLines []string
+	guidelines := append([]string(nil), in.Guidelines...)
+	for _, tool := range metadata {
+		toolLines = append(toolLines, "- "+escape(tool.Name)+": "+escape(tool.Summary))
+		guidelines = append(guidelines, tool.Guidelines...)
+	}
 	var rules []string
 	seen := map[string]bool{}
-	for _, rule := range in.Guidelines {
+	for _, rule := range guidelines {
 		rule = strings.TrimSpace(rule)
 		if rule != "" && !seen[rule] {
 			seen[rule] = true
@@ -70,7 +80,7 @@ func (c *PromptComposer) Compose(in PromptInput) (PromptState, error) {
 		appendices[i] = escape(text)
 	}
 	state, err := NewPromptState([]PromptSection{
-		{"core", escape(in.Core)}, {"tools", in.ToolsText}, {"rules", strings.Join(rules, "\n")},
+		{"core", escape(in.Core)}, {"tools", strings.Join(toolLines, "\n")}, {"rules", strings.Join(rules, "\n")},
 		{"user_context", renderContext(in.UserContext)}, {"project_context", renderContext(in.ProjectContext)},
 		{"skills", in.SkillsText}, {"runtime", escape(in.Runtime)}, {"plan", escape(in.Plan)}, {"addendum", strings.Join(appendices, "\n\n")},
 	})
