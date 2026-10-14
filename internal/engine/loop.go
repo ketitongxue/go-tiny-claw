@@ -22,6 +22,7 @@ type AgentEngine struct {
 	PlanMode       bool // 【新增】暴露给外部的计划模式开关
 	ContextBuilder *ctxpkg.ContextBuilder
 	ContextSpec    ctxpkg.ModelContextSpec
+	Prompts        ctxpkg.PromptSource
 	recovery       *ctxpkg.RecoveryManager // 【新增】自愈管理器
 	injector       *ReminderInjector       // 【新增】提醒注入器
 }
@@ -34,6 +35,7 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 		EnableThinking: enableThinking,
 		PlanMode:       planMode,
 		ContextBuilder: ctxpkg.NewContextBuilder(ctxpkg.ContextPolicy{}),
+		Prompts:        ctxpkg.PromptService{},
 		recovery:       ctxpkg.NewRecoveryManager(), // 初始化 Recovery
 		injector:       NewReminderInjector(),       // 【初始化注入器】
 	}
@@ -62,8 +64,15 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	}()
 
 	// 根据当前 Session 的工作区，动态组装最新的 System Prompt
-	composer := ctxpkg.NewPromptComposer(session.WorkDir, e.PlanMode)
-	systemMsg := composer.Build()
+	state, err := e.Prompts.Build(session.WorkDir, nil, e.PlanMode, false)
+	if err != nil {
+		return err
+	}
+	for key, value := range state.Metrics() {
+		rootSpan.AddAttribute(key, value)
+	}
+	systemMsg := state.Message()
+	ctx = context.WithValue(ctx, promptWorkspaceKey{}, session.WorkDir)
 
 	for turnCount := 1; ; turnCount++ {
 		if err := ctx.Err(); err != nil {
@@ -236,23 +245,20 @@ func (e *AgentEngine) runTurn(ctx context.Context, session *ctxpkg.Session, repo
 	return false, nil
 }
 
+type promptWorkspaceKey struct{}
+
 // RunSub 是专为 Subagent 拉起的一次性受限循环。
 // 它不依赖外部 Session，打完就跑。
 // Reporter：为了让用户在终端看到子智能体的工作轨迹，我们将主线程的 Reporter 透传进来，并打上特殊标记。
 func (e *AgentEngine) RunSub(ctx context.Context, taskPrompt string, readOnlyRegistry tools.Registry, reporter any) (string, error) {
 
-	// 【核心优化】：子智能体极其容易偷懒。我们必须在 System Prompt 中严厉警告它必须使用工具！
+	workDir, _ := ctx.Value(promptWorkspaceKey{}).(string)
+	state, err := e.Prompts.Build(workDir, nil, false, true)
+	if err != nil {
+		return "", err
+	}
 	contextHistory := []schema.Message{
-		{
-			Role: schema.RoleSystem,
-			Content: `你是一个专门负责深度探索的探路者 (Explorer Subagent)。
-你的任务是根据主架构师的指令，在当前工作区内仔细阅读代码、查阅日志，搜集足够的信息。
-
-【核心纪律】
-1. 你必须、且只能依靠内置工具（如 bash 的 find/grep，或 read_file）去寻找答案。绝对不允许凭空捏造或猜测！
-2. 如果你没有找到确切的答案，你必须继续使用工具深入搜索。
-3. 当且仅当你找到了确切的线索后，停止调用工具，直接输出一段纯文本作为你的终极汇报。主架构师会根据你的汇报来做下一步决策。`,
-		},
+		state.Message(),
 		{
 			Role:    schema.RoleUser,
 			Content: taskPrompt,

@@ -84,7 +84,11 @@ func TestPromptComposerRetainsWorkspaceInstructionsSkillsAndPlanMode(t *testing.
 		t.Fatal(err)
 	}
 	for _, plan := range []bool{false, true} {
-		msg := NewPromptComposer(dir, plan).Build()
+		state, err := (PromptService{}).Build(dir, nil, plan, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		msg := state.Message()
 		if msg.Role != schema.RoleSystem {
 			t.Fatal("composer did not create a system prompt")
 		}
