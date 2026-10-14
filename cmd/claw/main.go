@@ -195,7 +195,7 @@ func configureExecutors(ctx context.Context, opts options, output io.Writer) (se
 	return sessionExecutors{coding: coding, explorer: explorer}, nil
 }
 
-func run(ctx context.Context, args []string, output io.Writer) error {
+func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	if handled, err := dispatchCommand(ctx, args, commandIO{input: os.Stdin, output: output}); handled {
 		return err
 	}
@@ -225,6 +225,7 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		if err != nil {
 			return err
 		}
+		defer func() { runErr = errors.Join(runErr, resumed.Close()) }()
 		opts.workDir = resumed.WorkDir
 		opts.model = resumed.ModelRef().String()
 	}
@@ -317,13 +318,14 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		if err != nil {
 			return err
 		}
+		defer func() { runErr = errors.Join(runErr, sess.Close()) }()
 	}
 	eng, err := factory(ctx, sess, reporter)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(output, "Session: %s | Model: %s\n", sess.ID, sess.ModelRef())
-	if err := sess.Append(schema.Message{Role: schema.RoleUser, Content: opts.prompt}); err != nil {
+	if err := sess.Append(ctx, schema.Message{Role: schema.RoleUser, Content: opts.prompt}); err != nil {
 		return err
 	}
 	log.Println("启动终端演示（含工具、子智能体、费用统计和 Tracing）")

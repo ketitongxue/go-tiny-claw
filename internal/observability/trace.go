@@ -24,7 +24,8 @@ type Span struct {
 	Attributes map[string]interface{} `json:"attributes,omitempty"` // 存放元数据 (如消耗的 Token, 执行的命令)
 	Children   []*Span                `json:"children,omitempty"`   // 子跨度
 
-	mu sync.Mutex // 保护 Children 的并发写入
+	mu    sync.Mutex // protects span mutations
+	ended bool
 }
 
 // StartSpan 开启一个新的追踪跨度，并将其级联到 Context 中
@@ -49,8 +50,14 @@ func StartSpan(ctx context.Context, name string) (context.Context, *Span) {
 
 // EndSpan 结束跨度，计算耗时
 func (s *Span) EndSpan() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended {
+		return
+	}
 	s.EndTime = time.Now()
 	s.DurationMs = s.EndTime.Sub(s.StartTime).Milliseconds()
+	s.ended = true
 }
 
 // AddAttribute 为当前 Span 记录关键的元数据

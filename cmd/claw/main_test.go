@@ -269,7 +269,7 @@ func runSessionFactoryRegression(t *testing.T, opts options, executors sessionEx
 		return resp, nil
 	})
 	eng := newSessionEngine(p, sess, nil, opts, executors)
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: "run regression"})
+	sess.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "run regression"})
 	if err := eng.Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ esac`)
 		}
 	})
 	sess := ctxpkg.NewSession("explorer-policy", workDir)
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: "test Explorer isolation"})
+	sess.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "test Explorer isolation"})
 	if err := newSessionEngine(p, sess, nil, opts, executors).Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -429,7 +429,7 @@ func TestLocalExplorerDoesNotExposeUnsafeBash(t *testing.T) {
 		return &schema.Message{Role: schema.RoleAssistant, Content: "done"}, nil
 	})
 	eng := newSessionEngine(engProvider, sess, nil, opts, executors)
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: "read-only local exploration"})
+	sess.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "read-only local exploration"})
 	if err := eng.Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -453,7 +453,7 @@ func TestFeishuFactoryDeniesDangerousToolWithoutApprovalChannel(t *testing.T) {
 		}
 		return &schema.Message{Role: schema.RoleAssistant, Content: "denied"}, nil
 	})
-	sess.Append(schema.Message{Role: schema.RoleUser, Content: "approval test"})
+	sess.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "approval test"})
 	if err := newSessionEngine(p, sess, nil, options{mode: "feishu", model: "glm-5.2"}, sessionExecutors{coding: executor.NewLocalExecutor()}).Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
 	}

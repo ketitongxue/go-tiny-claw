@@ -3,7 +3,6 @@ package sessionstore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -15,6 +14,7 @@ import (
 var ErrNotFound = errors.New("session not found")
 var ErrCorrupted = errors.New("SessionCorrupted")
 var ErrExists = errors.New("session already exists")
+var ErrInUse = errors.New("session is currently in use by another claw process")
 
 type Metadata struct {
 	ID          string               `json:"session_id"`
@@ -54,6 +54,7 @@ type Event struct {
 func NewEvent(kind string) Event { return Event{Version: 1, Type: kind, Timestamp: time.Now()} }
 
 type Store interface {
+	AcquireWriter(context.Context, string) (SessionLock, error)
 	Create(context.Context, Snapshot) error
 	Append(context.Context, string, ...Event) error
 	Load(context.Context, string) (Snapshot, error)
@@ -83,7 +84,7 @@ func apply(s *Snapshot, e Event) error {
 		if e.Message == nil || s.Metadata.ID == "" {
 			return ErrCorrupted
 		}
-		s.History = append(s.History, *e.Message)
+		s.History = append(s.History, cloneMessage(*e.Message))
 	case "usage":
 		if e.Usage == nil || s.Metadata.ID == "" {
 			return ErrCorrupted
@@ -109,18 +110,75 @@ func creation(s Snapshot) []Event {
 	}
 	return events
 }
+func cloneMessage(m schema.Message) schema.Message {
+	if m.Usage != nil {
+		u := *m.Usage
+		m.Usage = &u
+	}
+	if m.ToolCalls != nil {
+		calls := make([]schema.ToolCall, len(m.ToolCalls))
+		for i, c := range m.ToolCalls {
+			calls[i] = c
+			calls[i].Arguments = append([]byte(nil), c.Arguments...)
+		}
+		m.ToolCalls = calls
+	}
+	return m
+}
+
 func clone(s Snapshot) Snapshot {
-	b, _ := json.Marshal(s)
-	var out Snapshot
-	_ = json.Unmarshal(b, &out)
-	return out
+	if s.History != nil {
+		history := make([]schema.Message, len(s.History))
+		for i, m := range s.History {
+			history[i] = cloneMessage(m)
+		}
+		s.History = history
+	}
+	return s
+}
+
+// A mutation copies the history slice, sharing only immutable committed messages.
+// apply owns each new message. No historical content is encoded or revalidated.
+func mutationSnapshot(s Snapshot, extra int) Snapshot {
+	history := make([]schema.Message, len(s.History), len(s.History)+extra)
+	copy(history, s.History)
+	s.History = history
+	return s
 }
 
 type memoryEntry struct {
 	mu       sync.RWMutex
 	snapshot Snapshot
 }
-type MemoryStore struct{ sessions sync.Map }
+type MemoryStore struct {
+	sessions sync.Map
+	writers  sync.Map
+}
+
+type memorySessionLock struct {
+	store *MemoryStore
+	id    string
+}
+
+func (l *memorySessionLock) Release() error {
+	l.store.writers.CompareAndDelete(l.id, l)
+	return nil
+}
+
+func (m *MemoryStore) AcquireWriter(ctx context.Context, id string) (SessionLock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	lock := &memorySessionLock{store: m, id: id}
+	if _, loaded := m.writers.LoadOrStore(id, lock); loaded {
+		return nil, ErrInUse
+	}
+	if err := ctx.Err(); err != nil {
+		_ = lock.Release()
+		return nil, err
+	}
+	return lock, nil
+}
 
 func NewMemoryStore() *MemoryStore { return &MemoryStore{} }
 func (m *MemoryStore) Create(ctx context.Context, s Snapshot) error {
@@ -146,11 +204,17 @@ func (m *MemoryStore) Append(ctx context.Context, id string, events ...Event) er
 	entry := v.(*memoryEntry)
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s := clone(entry.snapshot)
 	for _, e := range events {
 		if err := apply(&s, e); err != nil {
 			return err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	entry.snapshot = clone(s)
 	return nil
@@ -185,9 +249,11 @@ func (m *MemoryStore) List(ctx context.Context) ([]Metadata, error) {
 	return out, nil
 }
 func (m *MemoryStore) Delete(ctx context.Context, id string) error {
-	if err := ctx.Err(); err != nil {
+	lock, err := m.AcquireWriter(ctx, id)
+	if err != nil {
 		return err
 	}
+	defer lock.Release()
 	if _, ok := m.sessions.LoadAndDelete(id); !ok {
 		return ErrNotFound
 	}

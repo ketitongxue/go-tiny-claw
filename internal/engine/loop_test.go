@@ -70,7 +70,7 @@ func (r *recordingReporter) OnMessage(_ context.Context, content string) {
 
 func TestRunPreservesThinkingParallelToolsAndTrace(t *testing.T) {
 	session := ctxpkg.NewSession("chat-a", t.TempDir())
-	session.Append(schema.Message{Role: schema.RoleUser, Content: "inspect two files"})
+	session.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "inspect two files"})
 	registry := tools.NewRegistry()
 	started := make(chan struct{}, 2)
 	release := make(chan struct{})
@@ -179,7 +179,7 @@ func TestRunPassesRecoveryAndRepeatedFailureReminderToModel(t *testing.T) {
 		return &schema.Message{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: fmt.Sprint(calls), Name: "read_file", Arguments: json.RawMessage(`{"path":"missing"}`)}}}, nil
 	})
 	session := ctxpkg.NewSession("chat-recovery", t.TempDir())
-	session.Append(schema.Message{Role: schema.RoleUser, Content: "read file"})
+	session.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "read file"})
 	if err := NewAgentEngine(p, registry, false, false).Run(context.Background(), session, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestBashFailureRecoveryReachesNextModelTurn(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			session := ctxpkg.NewSession("bash-recovery", t.TempDir())
-			session.Append(schema.Message{Role: schema.RoleUser, Content: "run command"})
+			session.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "run command"})
 			registry := tools.NewRegistry()
 			registry.Register(tools.NewBashTool(session.WorkDir, tc.runner, executor.CodingPolicy()))
 			calls := 0

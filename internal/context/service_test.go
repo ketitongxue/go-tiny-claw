@@ -24,10 +24,13 @@ func TestDurableResumePinning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(schema.Message{Role: schema.RoleUser, Content: "remember"}); err != nil {
+	if err := s.Append(ctx, schema.Message{Role: schema.RoleUser, Content: "remember"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RecordUsage(10, 5, provider.UsageBilling{CostKnown: true, EstimatedCost: 2}); err != nil {
+	if err := s.RecordUsage(ctx, 10, 5, provider.UsageBilling{CostKnown: true, EstimatedCost: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 	model.ID = "model-b"
@@ -38,11 +41,14 @@ func TestDurableResumePinning(t *testing.T) {
 	if resumed.ModelRef().ModelID != "model-a" || len(resumed.GetWorkingMemory(0)) != 1 || resumed.UsageSnapshot().PromptTokens != 10 {
 		t.Fatal("resume lost facts")
 	}
-	if err := resumed.RecordUsage(3, 2, provider.UsageBilling{CostKnown: true}); err != nil {
+	if err := resumed.RecordUsage(ctx, 3, 2, provider.UsageBilling{CostKnown: true}); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := f.Load(ctx, "chat-a")
 	if err != nil || loaded.Usage.PromptTokens != 13 {
+		t.Fatal(err)
+	}
+	if err := resumed.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.RemoveAll(dir); err != nil {
@@ -72,13 +78,14 @@ func TestMutationFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Append(schema.Message{Role: schema.RoleUser, Content: "x"}); err == nil {
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "x"}); err == nil {
 		t.Fatal("failure hidden")
 	}
 	if len(s.GetWorkingMemory(0)) != 0 {
 		t.Fatal("memory committed on failure")
 	}
-	if err := s.RecordUsage(10, 10, provider.UsageBilling{}); err == nil {
+	if err := s.RecordUsage(context.Background(), 10, 10, provider.UsageBilling{}); err == nil {
 		t.Fatal("failure hidden")
 	}
 	if s.UsageSnapshot().PromptTokens != 0 {

@@ -108,8 +108,10 @@ func (b *BenchmarkRunner) runSingleTest(ctx context.Context, tc TestCase) TestRe
 	registry.Register(tools.NewBashTool(workDir, b.executor, executor.CodingPolicy()))
 	registry.Register(tools.NewEditFileTool(workDir))
 	eng := engine.NewAgentEngine(tracked, registry, false, false)
-	session.Append(schema.Message{Role: schema.RoleUser, Content: tc.TaskPrompt})
-	err = eng.Run(ctx, session, nil)
+	err = session.Append(ctx, schema.Message{Role: schema.RoleUser, Content: tc.TaskPrompt})
+	if err == nil {
+		err = eng.Run(ctx, session, nil)
+	}
 	if err != nil {
 		result.ErrorMsg = fmt.Sprintf("Agent 失败: %v", err)
 	} else if _, err = b.runScript(ctx, workDir, tc.ValidateScript); err != nil {

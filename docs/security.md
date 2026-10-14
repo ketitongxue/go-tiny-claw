@@ -21,7 +21,11 @@
 
 事件 schema v1 保存 session_created、完整 schema.Message、usage、metadata_updated；不保存 API Key 或 OAuth Access/Refresh/ID Token。模型 identity 固定，恢复只消费 ProviderManager / AuthManager 的解析与 refresh 能力。用户主动把秘密贴进 Prompt 或代码时，秘密仍可能进入对话记录；本模块不进行正文秘密检测或加密。
 
-Append / Usage 持久化失败会返回错误，不假装成功。尾部损坏 JSONL 记录可恢复，中间损坏明确拒绝；重建合法 Tool Chain 失败时拒绝推理。创建采用私密临时文件 + sync + 原子发布，追加按 Session 独立锁与 sync。仅支持同进程并发、单进程拥有 Store；不要运行多个进程同时修改同一 Session。崩溃在 Tool Call 与结果之间可能留下未完成链，当前拒绝恢复推理，不自动重跑有副作用的工具。
+Append / Usage 持久化失败会返回错误，不假装成功。尾部损坏 JSONL 记录可恢复，中间损坏明确拒绝；重建合法 Tool Chain 失败时拒绝推理。创建采用私密临时文件 + sync + 原子发布，追加按 Session 独立 mutex 与 sync。Snapshot / Offset 仅在 Write、Sync、Close 成功后发布；失败后保留最后提交状态并恢复尾部，恢复本身失败则拒绝继续提交，等待后续恢复重试。任务 Context 传到 Persistence，取消不会刻意打断已经开始的文件提交。崩溃在 Tool Call 与结果之间可能留下未完成链，当前拒绝恢复推理，不自动重跑有副作用的工具。
+
+M5.1 使用 **每 Session、单进程 writer ownership**：macOS / Linux 的 OS `flock` 作用于 SHA256(SessionID) 命名的 0600 `.lock` 文件。Demo 与飞书 worker 在会话运行生命周期内持有锁；Create / Append / Usage / Delete 均受保护，活动 Session 的外部 mutation 会被拒绝。只读 List / Show 不获取 writer lock，读取完整事件前缀，按现有规则忽略尾部 torn event。OS 在进程退出或崩溃后自动释放锁；保留 `.lock` 文件是正常行为，**不要删除活动锁文件**，否则新 inode 可能绕过已有锁。
+
+**Session writer lock 不是安全边界**，仅用于合作进程的一致性保护，不阻止同一 OS 用户、LocalExecutor 或其他绕过协议的程序直接修改文件。它不实现多进程同时写同一 Session，不覆盖 AuthStore / OAuth refresh，不提供分布式 / 网络文件系统锁保证。当前 writer lock 仅支持 macOS / Linux；其他平台的 mutation 会明确拒绝，而不是静默无锁运行。Session JSONL 仍是敏感本地明文数据，锁不提供保密性、磁盘加密、配额或安全擦除。
 
 ContextBuilder 的省略与截断仅是当前 Provider 请求视图，绝不回写历史。Thinking 正文默认不进入 Conversation / Trace。`session delete` 只删除 Session 文件，不能删除 WorkDir、代码、Trace，也不保证底层存储上的安全擦除；备份和 Trace 需独立管理。
 

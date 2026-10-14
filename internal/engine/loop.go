@@ -65,171 +65,175 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	composer := ctxpkg.NewPromptComposer(session.WorkDir, e.PlanMode)
 	systemMsg := composer.Build()
 
-	turnCount := 0
-
-	for {
+	for turnCount := 1; ; turnCount++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		turnCount++
-
-		// 【埋点 2】：记录单次 Turn 循环
-		turnCtx, turnSpan := observability.StartSpan(ctx, fmt.Sprintf("Turn-%d", turnCount))
-		defer turnSpan.EndSpan() // 利用 defer，哪怕遇到了 break 或 error 也会计算耗时
-
-		availableTools := e.registry.GetAvailableTools()
-
-		history := session.GetWorkingMemory(0)
-		built, err := e.buildContext(systemMsg, history, availableTools, turnSpan, e.ContextSpec)
+		done, err := e.runTurn(ctx, session, reporter, systemMsg, turnCount)
 		if err != nil {
 			return err
 		}
-		compactedContext := built.Messages
+		if done {
+			return nil
+		}
+	}
+}
 
-		// 3. 后续的 Provider.Generate 全面使用被保护过的新鲜上下文 (compactedContext)
-		// ================= Phase 1: Thinking =================
-		if e.EnableThinking {
-			if reporter != nil {
-				reporter.OnThinking(ctx)
-			}
+// runTurn bounds the span's defer to one turn, including every error path.
+func (e *AgentEngine) runTurn(ctx context.Context, session *ctxpkg.Session, reporter Reporter, systemMsg schema.Message, turnCount int) (bool, error) {
+	turnCtx, turnSpan := observability.StartSpan(ctx, fmt.Sprintf("Turn-%d", turnCount))
+	defer turnSpan.EndSpan()
 
-			// 【埋点 3】：记录 Thinking 调用
-			thinkCtx, thinkSpan := observability.StartSpan(turnCtx, "LLM.Thinking")
+	availableTools := e.registry.GetAvailableTools()
 
-			thinkResp, err := e.generate(thinkCtx, systemMsg, history, compactedContext, nil, thinkSpan)
-			if err != nil {
-				thinkSpan.AddAttribute("status", "error")
-			} else {
-				thinkSpan.AddAttribute("status", "ok")
-				if thinkResp.Usage != nil {
-					thinkSpan.AddAttribute("prompt_tokens", thinkResp.Usage.PromptTokens)
-					thinkSpan.AddAttribute("completion_tokens", thinkResp.Usage.CompletionTokens)
-				}
-			}
-			thinkSpan.EndSpan() // Metadata only; never record Thinking body.
+	history := session.GetWorkingMemory(0)
+	built, err := e.buildContext(systemMsg, history, availableTools, turnSpan, e.ContextSpec)
+	if err != nil {
+		return false, err
+	}
+	compactedContext := built.Messages
 
-			if err != nil {
-				return fmt.Errorf("Thinking 阶段失败: %w", err)
-			}
-			if thinkResp.Content != "" {
-				// Thinking is ephemeral: rebuild the Action view with it included.
-				history = append(history, *thinkResp)
-				built, err = e.buildContext(systemMsg, history, availableTools, turnSpan, e.ContextSpec)
-				if err != nil {
-					return err
-				}
-				compactedContext = built.Messages
-			}
+	// 3. 后续的 Provider.Generate 全面使用被保护过的新鲜上下文 (compactedContext)
+	// ================= Phase 1: Thinking =================
+	if e.EnableThinking {
+		if reporter != nil {
+			reporter.OnThinking(ctx)
 		}
 
-		// ================= Phase 2: Action =================
-		// 【埋点 4】：记录 Action 调用
-		actCtx, actSpan := observability.StartSpan(turnCtx, "LLM.Action")
-		actionResp, err := e.generate(actCtx, systemMsg, history, compactedContext, availableTools, turnSpan)
-		actSpan.EndSpan() // 结束行动跨度
+		// 【埋点 3】：记录 Thinking 调用
+		thinkCtx, thinkSpan := observability.StartSpan(turnCtx, "LLM.Thinking")
+
+		thinkResp, err := e.generate(thinkCtx, systemMsg, history, compactedContext, nil, thinkSpan)
+		if err != nil {
+			thinkSpan.AddAttribute("status", "error")
+		} else {
+			thinkSpan.AddAttribute("status", "ok")
+			if thinkResp.Usage != nil {
+				thinkSpan.AddAttribute("prompt_tokens", thinkResp.Usage.PromptTokens)
+				thinkSpan.AddAttribute("completion_tokens", thinkResp.Usage.CompletionTokens)
+			}
+		}
+		thinkSpan.EndSpan() // Metadata only; never record Thinking body.
 
 		if err != nil {
-			return fmt.Errorf("Action 阶段失败: %w", err)
+			return false, fmt.Errorf("Thinking 阶段失败: %w", err)
 		}
-
-		// (上一讲修复 1214 的关键代码：合并为合法的单条 Assistant 消息)
-		finalAssistantMsg := schema.Message{
-			Role:      schema.RoleAssistant,
-			Content:   strings.TrimSpace(actionResp.Content),
-			Usage:     actionResp.Usage,
-			ToolCalls: actionResp.ToolCalls,
-		}
-
-		// 将大模型的行动响应持久化到 Session 中
-		if err := session.Append(finalAssistantMsg); err != nil {
-			return err
-		}
-
-		if actionResp.Content != "" && reporter != nil {
-			reporter.OnMessage(ctx, actionResp.Content)
-		}
-
-		if len(actionResp.ToolCalls) == 0 {
-			// 如果没有工具调用，说明本次任务已完成，打破 ReAct 循环，挂起等待人类的下一条指令
-			turnSpan.EndSpan() // 没有工具调用，正常结束
-			break
-		}
-
-		// 4. ================= 并发执行底层工具 =================
-		observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
-		var wg sync.WaitGroup
-
-		// 用于收集本轮执行的最后一个工具，供 Reminder 探测器分析
-		// (在真实的工业级架构中，如果并发调用了多个工具，我们可以逐个分析或仅分析报错的那个。这里简化为取第一个)
-		var lastToolCall schema.ToolCall
-		var lastToolResult schema.ToolResult
-
-		for i, toolCall := range actionResp.ToolCalls {
-			wg.Add(1)
-
-			go func(idx int, call schema.ToolCall) {
-				defer wg.Done()
-
-				if reporter != nil {
-					reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
-				}
-
-				result := e.registry.Execute(turnCtx, call)
-
-				// 【核心拦截与注入】
-				finalOutput := result.Output
-				if result.IsError {
-					// 发生错误，交由 RecoveryManager 诊断并注入“锦囊妙计”
-					finalOutput = e.recovery.AnalyzeAndInject(call.Name, result.Output)
-					log.Printf("  -> [Go-%d] ❌ 注入救援指南: %s\n", idx, finalOutput)
-				} else {
-					log.Printf("  -> [Go-%d] ✅ 工具执行成功 (返回 %d 字节)\n", idx, len(result.Output))
-				}
-
-				if reporter != nil {
-					displayOutput := finalOutput
-					if len([]rune(displayOutput)) > 200 {
-						displayOutput = string([]rune(displayOutput)[:200]) + "... (已截断)"
-					}
-					reporter.OnToolResult(ctx, call.Name, displayOutput, result.IsError)
-				}
-
-				observationMsgs[idx] = schema.Message{
-					Role:       schema.RoleUser,
-					Content:    finalOutput,
-					ToolCallID: call.ID,
-				}
-
-				// 捕获状态供外部探测器使用
-				if idx == 0 {
-					lastToolCall = call
-					lastToolResult = result
-				}
-			}(i, toolCall)
-		}
-
-		wg.Wait()
-
-		// 1. 先将所有的工具执行结果（Observation）持久化到 Session 中，开启下一轮的复盘与推理
-		if err := session.Append(observationMsgs...); err != nil {
-			return err
-		}
-
-		// 结束本轮 Turn 的 Span
-		turnSpan.EndSpan()
-
-		// 2. 【核心防线】：在准备进入下一轮之前，进行死循环探测！
-		reminderMsg := e.injector.CheckAndInject(lastToolCall, lastToolResult)
-		if reminderMsg != nil {
-			// 如果触发了干预规则，将这条严厉的提醒作为 User 消息，强制追加到 Session 的最末尾！
-			// 大模型在下一轮被唤醒时，第一眼就会看到这句话，从而打破局部执念。
-			if err := session.Append(*reminderMsg); err != nil {
-				return err
+		if thinkResp.Content != "" {
+			// Thinking is ephemeral: rebuild the Action view with it included.
+			history = append(history, *thinkResp)
+			built, err = e.buildContext(systemMsg, history, availableTools, turnSpan, e.ContextSpec)
+			if err != nil {
+				return false, err
 			}
+			compactedContext = built.Messages
 		}
 	}
 
-	return nil
+	// ================= Phase 2: Action =================
+	// 【埋点 4】：记录 Action 调用
+	actCtx, actSpan := observability.StartSpan(turnCtx, "LLM.Action")
+	actionResp, err := e.generate(actCtx, systemMsg, history, compactedContext, availableTools, turnSpan)
+	actSpan.EndSpan() // 结束行动跨度
+
+	if err != nil {
+		return false, fmt.Errorf("Action 阶段失败: %w", err)
+	}
+
+	// (上一讲修复 1214 的关键代码：合并为合法的单条 Assistant 消息)
+	finalAssistantMsg := schema.Message{
+		Role:      schema.RoleAssistant,
+		Content:   strings.TrimSpace(actionResp.Content),
+		Usage:     actionResp.Usage,
+		ToolCalls: actionResp.ToolCalls,
+	}
+
+	// 将大模型的行动响应持久化到 Session 中
+	if err := session.Append(turnCtx, finalAssistantMsg); err != nil {
+		return false, err
+	}
+	if err := turnCtx.Err(); err != nil {
+		return false, err
+	}
+
+	if actionResp.Content != "" && reporter != nil {
+		reporter.OnMessage(ctx, actionResp.Content)
+	}
+
+	if len(actionResp.ToolCalls) == 0 {
+		return true, nil
+	}
+
+	// 4. ================= 并发执行底层工具 =================
+	observationMsgs := make([]schema.Message, len(actionResp.ToolCalls))
+	var wg sync.WaitGroup
+
+	// 用于收集本轮执行的最后一个工具，供 Reminder 探测器分析
+	// (在真实的工业级架构中，如果并发调用了多个工具，我们可以逐个分析或仅分析报错的那个。这里简化为取第一个)
+	var lastToolCall schema.ToolCall
+	var lastToolResult schema.ToolResult
+
+	for i, toolCall := range actionResp.ToolCalls {
+		wg.Add(1)
+
+		go func(idx int, call schema.ToolCall) {
+			defer wg.Done()
+
+			if reporter != nil {
+				reporter.OnToolCall(ctx, call.Name, string(call.Arguments))
+			}
+
+			result := e.registry.Execute(turnCtx, call)
+
+			// 【核心拦截与注入】
+			finalOutput := result.Output
+			if result.IsError {
+				// 发生错误，交由 RecoveryManager 诊断并注入“锦囊妙计”
+				finalOutput = e.recovery.AnalyzeAndInject(call.Name, result.Output)
+				log.Printf("  -> [Go-%d] ❌ 注入救援指南: %s\n", idx, finalOutput)
+			} else {
+				log.Printf("  -> [Go-%d] ✅ 工具执行成功 (返回 %d 字节)\n", idx, len(result.Output))
+			}
+
+			if reporter != nil {
+				displayOutput := finalOutput
+				if len([]rune(displayOutput)) > 200 {
+					displayOutput = string([]rune(displayOutput)[:200]) + "... (已截断)"
+				}
+				reporter.OnToolResult(ctx, call.Name, displayOutput, result.IsError)
+			}
+
+			observationMsgs[idx] = schema.Message{
+				Role:       schema.RoleUser,
+				Content:    finalOutput,
+				ToolCallID: call.ID,
+			}
+
+			// 捕获状态供外部探测器使用
+			if idx == 0 {
+				lastToolCall = call
+				lastToolResult = result
+			}
+		}(i, toolCall)
+	}
+
+	wg.Wait()
+
+	// 1. 先将所有的工具执行结果（Observation）持久化到 Session 中，开启下一轮的复盘与推理
+	if err := session.Append(turnCtx, observationMsgs...); err != nil {
+		return false, err
+	}
+
+	// 2. 【核心防线】：在准备进入下一轮之前，进行死循环探测！
+	reminderMsg := e.injector.CheckAndInject(lastToolCall, lastToolResult)
+	if reminderMsg != nil {
+		// 如果触发了干预规则，将这条严厉的提醒作为 User 消息，强制追加到 Session 的最末尾！
+		// 大模型在下一轮被唤醒时，第一眼就会看到这句话，从而打破局部执念。
+		if err := session.Append(turnCtx, *reminderMsg); err != nil {
+			return false, err
+		}
+	}
+
+	return false, nil
 }
 
 // RunSub 是专为 Subagent 拉起的一次性受限循环。

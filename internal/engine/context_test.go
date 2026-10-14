@@ -32,7 +32,7 @@ func TestThirtyTurnsNoCharCompactor(t *testing.T) {
 		return &schema.Message{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: fmt.Sprintf("r%d", calls), Name: "read_file", Arguments: []byte(`{"path":"x"}`)}, {ID: fmt.Sprintf("b%d", calls), Name: "bash", Arguments: []byte(`{"command":"echo x"}`)}}}, nil
 	})
 	s := ctxpkg.NewSession("long", t.TempDir())
-	if err := s.Append(schema.Message{Role: schema.RoleUser, Content: "task"}); err != nil {
+	if err := s.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "task"}); err != nil {
 		t.Fatal(err)
 	}
 	eng := NewAgentEngine(p, registry, false, false)
@@ -72,7 +72,7 @@ func TestContextLimitOnlyOneRetry(t *testing.T) {
 			return &schema.Message{Role: schema.RoleAssistant}, nil
 		})
 		s := ctxpkg.NewSession("retry", t.TempDir())
-		s.Append(schema.Message{Role: schema.RoleUser, Content: "task"})
+		s.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "task"})
 		err := NewAgentEngine(p, tools.NewRegistry(), false, false).Run(context.Background(), s, nil)
 		if calls != 2 || (err != nil) != alwaysFail {
 			t.Fatalf("calls=%d err=%v", calls, err)

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -31,7 +32,7 @@ func TestSessionCommandsOnlyMetadataAndDeleteStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sess.Append(schema.Message{Role: schema.RoleUser, Content: "private prompt must not display"}); err != nil {
+	if err := sess.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "private prompt must not display"}); err != nil {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{{"sessions"}, {"session", "show", "demo-id"}} {
@@ -44,6 +45,12 @@ func TestSessionCommandsOnlyMetadataAndDeleteStore(t *testing.T) {
 		}
 	}
 	var out bytes.Buffer
+	if err := runCommand(context.Background(), []string{"session", "delete", "demo-id"}, runtime, commandIO{output: &out}); !errors.Is(err, sessionstore.ErrInUse) {
+		t.Fatalf("active delete error = %v", err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := runCommand(context.Background(), []string{"session", "delete", "demo-id"}, runtime, commandIO{output: &out}); err != nil {
 		t.Fatal(err)
 	}

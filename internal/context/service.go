@@ -53,6 +53,8 @@ func UniqueSessionID() (string, error) {
 
 // SessionService owns durable session lifecycle. Mutations live on Session so
 // callers cannot accidentally update memory without writing the corresponding fact.
+// Create/Resume/GetOrCreate acquire writer ownership before touching the file.
+// Callers must Close the returned Session when its runtime lifecycle ends.
 type SessionService struct {
 	Store    sessionstore.Store
 	locks    sync.Map
@@ -73,13 +75,17 @@ func (s *SessionService) Create(ctx context.Context, id, dir string, model provi
 	return s.create(ctx, id, dir, model, authType)
 }
 func (s *SessionService) create(ctx context.Context, id, dir string, model provider.ModelInfo, authType string) (*Session, error) {
+	writer, err := s.Store.AcquireWriter(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	sess := NewSession(id, dir)
 	sess.SetModelInfo(model)
 	sess.SetAuthType(authType)
 	if err := s.Store.Create(ctx, sess.snapshotLocked()); err != nil {
-		return nil, err
+		return nil, errors.Join(err, writer.Release())
 	}
-	sess.store = s.Store
+	s.attach(sess, writer)
 	s.sessions.Store(id, sess)
 	return sess, nil
 }
@@ -93,19 +99,32 @@ func (s *SessionService) Resume(ctx context.Context, id string) (*Session, error
 	return s.Load(ctx, id)
 }
 func (s *SessionService) load(ctx context.Context, id string) (*Session, error) {
-	if v, ok := s.sessions.Load(id); ok {
-		return v.(*Session), nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	snap, err := s.Store.Load(ctx, id)
+	if v, ok := s.sessions.Load(id); ok {
+		sess := v.(*Session)
+		sess.mu.RLock()
+		closed := sess.closed
+		sess.mu.RUnlock()
+		if !closed {
+			return sess, nil
+		}
+	}
+	writer, err := s.Store.AcquireWriter(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	snap, err := s.Store.Load(ctx, id)
+	if err != nil {
+		return nil, errors.Join(err, writer.Release())
+	}
 	info, err := os.Stat(snap.Metadata.WorkDir)
 	if err != nil {
-		return nil, fmt.Errorf("resume workdir unavailable: %w", err)
+		return nil, errors.Join(fmt.Errorf("resume workdir unavailable: %w", err), writer.Release())
 	}
 	if !info.IsDir() {
-		return nil, errors.New("resume workdir is not a directory")
+		return nil, errors.Join(errors.New("resume workdir is not a directory"), writer.Release())
 	}
 	m, u := snap.Metadata, snap.Usage
 	sess := NewSession(m.ID, m.WorkDir)
@@ -121,10 +140,16 @@ func (s *SessionService) load(ctx context.Context, id string) (*Session, error) 
 	sess.TotalEstimatedCost = u.EstimatedCost
 	sess.CostKnown = u.CostKnown
 	sess.Currency = u.Currency
-	sess.store = s.Store
+	s.attach(sess, writer)
 	s.sessions.Store(id, sess)
 	return sess, nil
 }
+func (s *SessionService) attach(sess *Session, writer sessionstore.SessionLock) {
+	sess.store = s.Store
+	sess.writer = writer
+	sess.onClose = func() { s.sessions.CompareAndDelete(sess.ID, sess) }
+}
+
 func (s *SessionService) GetOrCreate(ctx context.Context, id, dir string, model provider.ModelInfo, authType string) (*Session, error) {
 	mu := s.lock(id)
 	mu.Lock()

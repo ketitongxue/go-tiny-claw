@@ -48,7 +48,7 @@ func (t *CostTracker) Generate(ctx context.Context, msgs []schema.Message, tools
 	latency := time.Since(start)
 	if err != nil {
 		if t.session != nil {
-			if persistErr := t.session.MarkCostUnknown(); persistErr != nil {
+			if persistErr := t.session.MarkCostUnknown(ctx); persistErr != nil {
 				return nil, persistErr
 			}
 		}
@@ -57,7 +57,7 @@ func (t *CostTracker) Generate(ctx context.Context, msgs []schema.Message, tools
 	}
 	if msg == nil || msg.Usage == nil {
 		if t.session != nil {
-			if persistErr := t.session.MarkCostUnknown(); persistErr != nil {
+			if persistErr := t.session.MarkCostUnknown(ctx); persistErr != nil {
 				return nil, persistErr
 			}
 		}
@@ -68,7 +68,7 @@ func (t *CostTracker) Generate(ctx context.Context, msgs []schema.Message, tools
 	billing := EstimateUsage(t.model, usage)
 	log.Printf("[Tracker] 模型: %s | 耗时: %v | 输入: %d tk (缓存命中: %d tk) | 输出: %d tk | %s", t.model.Ref(), latency, usage.PromptTokens, max(0, min(usage.CachedPromptTokens, usage.PromptTokens)), usage.CompletionTokens, billing)
 	if t.session != nil {
-		if err := t.session.RecordUsage(max(0, usage.PromptTokens), max(0, usage.CompletionTokens), billing); err != nil {
+		if err := t.session.RecordUsage(ctx, max(0, usage.PromptTokens), max(0, usage.CompletionTokens), billing); err != nil {
 			return nil, err
 		}
 		log.Printf("[Tracker] 会话 %s | %s", t.session.ID, t.session.UsageSnapshot().Billing())

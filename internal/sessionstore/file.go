@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,15 +15,46 @@ import (
 )
 
 // Locks are per path, shared between FileStore instances in this process.
-// A store is intended to have a single owning process.
+// They synchronize goroutines, not cross-process writer ownership.
 var fileLocks sync.Map
 
 func pathLock(path string) *sync.Mutex {
+	if v, ok := fileLocks.Load(path); ok {
+		return v.(*sync.Mutex)
+	}
 	v, _ := fileLocks.LoadOrStore(path, &sync.Mutex{})
 	return v.(*sync.Mutex)
 }
 
-type FileStore struct{ dir string }
+type fileSessionState struct {
+	mu              *sync.Mutex
+	loaded          bool
+	snapshot        Snapshot
+	committedOffset int64
+	fileSize        int64
+	info            os.FileInfo
+	needsSeparator  bool
+	needsRecovery   bool // a failed commit must roll back before replay/append
+	writer          *fileSessionLock
+}
+
+type appendFile interface {
+	Write([]byte) (int, error)
+	Seek(int64, int) (int64, error)
+	Truncate(int64) error
+	Chmod(os.FileMode) error
+	Stat() (os.FileInfo, error)
+	Sync() error
+	Close() error
+}
+
+type FileStore struct {
+	dir    string
+	states sync.Map
+	// Instance-scoped I/O seams for deterministic replay/failure tests.
+	read       func(string) ([]byte, error)
+	openAppend func(string) (appendFile, error)
+}
 
 func NewFileStore(dir string) (*FileStore, error) {
 	dir, err := filepath.Abs(dir)
@@ -44,10 +76,20 @@ func NewFileStore(dir string) (*FileStore, error) {
 			return nil, err
 		}
 	}
-	return &FileStore{dir: dir}, nil
+	return &FileStore{dir: dir, read: readFile, openAppend: func(p string) (appendFile, error) {
+		return os.OpenFile(p, os.O_WRONLY, 0600)
+	}}, nil
 }
 func (f *FileStore) path(id string) string {
 	return filepath.Join(f.dir, fmt.Sprintf("%x.jsonl", sha256.Sum256([]byte(id))))
+}
+func (f *FileStore) state(id string) *fileSessionState {
+	p := f.path(id)
+	if v, ok := f.states.Load(p); ok {
+		return v.(*fileSessionState)
+	}
+	v, _ := f.states.LoadOrStore(p, &fileSessionState{mu: pathLock(p)})
+	return v.(*fileSessionState)
 }
 func encode(events []Event) ([]byte, error) {
 	var b bytes.Buffer
@@ -59,19 +101,34 @@ func encode(events []Event) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
-func (f *FileStore) Create(ctx context.Context, s Snapshot) error {
-	if s.Metadata.ID == "" {
-		return errors.New("session ID required")
-	}
+func (f *FileStore) Create(ctx context.Context, s Snapshot) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if s.Metadata.ID == "" {
+		return errors.New("session ID required")
+	}
 	p := f.path(s.Metadata.ID)
-	mu := pathLock(p)
-	mu.Lock()
-	defer mu.Unlock()
-	data, err := encode(creation(s))
+	st := f.state(s.Metadata.ID)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	release, err := f.mutationGuard(ctx, s.Metadata.ID, st)
 	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, release()) }()
+	events := creation(s)
+	var committed Snapshot
+	for _, e := range events {
+		if err := apply(&committed, e); err != nil {
+			return err
+		}
+	}
+	data, err := encode(events)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	// Publish only a complete, synced creation record.
@@ -80,18 +137,23 @@ func (f *FileStore) Create(ctx context.Context, s Snapshot) error {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if err = tmp.Chmod(0600); err == nil {
-		_, err = tmp.Write(data)
+	err = tmp.Chmod(0600)
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err == nil {
+		var n int
+		n, err = tmp.Write(data)
+		if err == nil && n != len(data) {
+			err = io.ErrShortWrite
+		}
 	}
 	if err == nil {
 		err = tmp.Sync()
 	}
 	closeErr := tmp.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
+	if err != nil || closeErr != nil {
+		return errors.Join(err, closeErr)
 	}
 	if err = os.Link(tmp.Name(), p); errors.Is(err, os.ErrExist) {
 		return ErrExists
@@ -99,7 +161,21 @@ func (f *FileStore) Create(ctx context.Context, s Snapshot) error {
 	if err != nil {
 		return err
 	}
-	return syncDirectory(f.dir)
+	if err := syncDirectory(f.dir); err != nil {
+		return err
+	}
+	info, err := sessionFileInfo(p)
+	if err != nil {
+		return err
+	}
+	st.snapshot = committed
+	st.committedOffset = int64(len(data))
+	st.fileSize = int64(len(data))
+	st.info = info
+	st.needsSeparator = false
+	st.needsRecovery = false
+	st.loaded = true
+	return nil
 }
 
 // replay returns the last committed byte offset. A torn final record is ignored,
@@ -129,7 +205,7 @@ func replay(data []byte) (Snapshot, int, error) {
 	}
 	return s, min(offset, len(data)), nil
 }
-func readFile(p string) ([]byte, error) {
+func sessionFileInfo(p string) (os.FileInfo, error) {
 	info, err := os.Lstat(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrNotFound
@@ -143,18 +219,40 @@ func readFile(p string) ([]byte, error) {
 	if err := os.Chmod(p, 0600); err != nil {
 		return nil, err
 	}
+	return info, nil
+}
+func readFile(p string) ([]byte, error) {
+	if _, err := sessionFileInfo(p); err != nil {
+		return nil, err
+	}
 	return os.ReadFile(p)
 }
-func (f *FileStore) Append(ctx context.Context, id string, events ...Event) error {
+
+// Caller holds st.mu. Size, identity and mtime detect changes outside this cache.
+func (f *FileStore) ensureLoaded(ctx context.Context, id string, st *fileSessionState, fresh bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if st.needsRecovery {
+		if err := f.recoverFailedCommit(id, st); err != nil {
+			return err
+		}
+	}
 	p := f.path(id)
-	mu := pathLock(p)
-	mu.Lock()
-	defer mu.Unlock()
-	data, err := readFile(p)
+	info, err := sessionFileInfo(p)
 	if err != nil {
+		st.loaded = false
+		return err
+	}
+	if !fresh && st.loaded && info.Size() == st.fileSize && os.SameFile(info, st.info) && info.ModTime().Equal(st.info.ModTime()) {
+		return ctx.Err()
+	}
+	st.loaded = false
+	data, err := f.read(p)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	s, n, err := replay(data)
@@ -164,8 +262,62 @@ func (f *FileStore) Append(ctx context.Context, id string, events ...Event) erro
 	if s.Metadata.ID != id {
 		return ErrCorrupted
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	st.snapshot = s
+	st.committedOffset = int64(n)
+	st.fileSize = int64(len(data))
+	st.info = info
+	st.needsSeparator = n > 0 && data[n-1] != '\n'
+	st.loaded = true
+	return nil
+}
+
+// Recovery is synchronous and deliberately not cancelable once a commit started.
+// If rollback itself fails, retain the old snapshot/offset and retry it before
+// the next operation; never replay a failed batch into committed memory.
+func (f *FileStore) recoverFailedCommit(id string, st *fileSessionState) error {
+	file, err := f.openAppend(f.path(id))
+	if err != nil {
+		return fmt.Errorf("session commit recovery: %w", err)
+	}
+	err = file.Truncate(st.committedOffset)
+	if err == nil {
+		err = file.Sync()
+	}
+	info, statErr := file.Stat()
+	closeErr := file.Close()
+	if err = errors.Join(err, statErr, closeErr); err != nil {
+		return fmt.Errorf("session commit recovery: %w", err)
+	}
+	st.fileSize = st.committedOffset
+	st.info = info
+	st.needsRecovery = false
+	return nil
+}
+
+func (f *FileStore) Append(ctx context.Context, id string, events ...Event) (retErr error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	st := f.state(id)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	release, err := f.mutationGuard(ctx, id, st)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, release()) }()
+	if err := f.ensureLoaded(ctx, id, st, false); err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		return nil
+	}
+	next := mutationSnapshot(st.snapshot, len(events))
 	for _, e := range events {
-		if err := apply(&s, e); err != nil {
+		if err := apply(&next, e); err != nil {
 			return err
 		}
 	}
@@ -173,52 +325,76 @@ func (f *FileStore) Append(ctx context.Context, id string, events ...Event) erro
 	if err != nil {
 		return err
 	}
-	file, err := os.OpenFile(p, os.O_WRONLY, 0600)
+	if st.needsSeparator {
+		encoded = append([]byte{'\n'}, encoded...)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	file, err := f.openAppend(f.path(id))
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	if err := file.Chmod(0600); err != nil {
+	// Last cancellation checkpoint: after mutation starts, finish sync/close or
+	// rollback, even if ctx is canceled in the meantime.
+	err = ctx.Err()
+	if err == nil {
+		err = file.Chmod(0600)
+	}
+	started := err == nil
+	if err == nil && st.fileSize != st.committedOffset {
+		err = file.Truncate(st.committedOffset)
+	}
+	if err == nil {
+		_, err = file.Seek(st.committedOffset, io.SeekStart)
+	}
+	if err == nil {
+		var n int
+		n, err = file.Write(encoded)
+		if err == nil && n != len(encoded) {
+			err = io.ErrShortWrite
+		}
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	info, statErr := file.Stat()
+	closeErr := file.Close()
+	if err = errors.Join(err, statErr, closeErr); err != nil {
+		if started {
+			st.needsRecovery = true
+			err = errors.Join(err, f.recoverFailedCommit(id, st))
+		}
 		return err
 	}
-	if err := file.Truncate(int64(n)); err != nil {
-		return err
-	}
-	if _, err := file.Seek(int64(n), 0); err != nil {
-		return err
-	}
-	// A valid final event without a newline still needs a separator.
-	if n > 0 && data[n-1] != '\n' {
-		encoded = append([]byte{'\n'}, encoded...)
-	}
-	if _, err = file.Write(encoded); err != nil {
-		_ = file.Truncate(int64(n))
-		return err
-	}
-	if err = file.Sync(); err != nil {
-		_ = file.Truncate(int64(n))
-		_ = file.Sync()
-		return err
-	}
-	return file.Close()
+	// Disk commit succeeded. Only now publish the candidate snapshot and offset.
+	st.snapshot = next
+	st.committedOffset += int64(len(encoded))
+	st.fileSize = st.committedOffset
+	st.info = info
+	st.needsSeparator = false
+	return nil
 }
-func (f *FileStore) Load(ctx context.Context, id string) (Snapshot, error) {
+func (f *FileStore) Load(ctx context.Context, id string) (snap Snapshot, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, err
 	}
-	p := f.path(id)
-	mu := pathLock(p)
-	mu.Lock()
-	defer mu.Unlock()
-	data, err := readFile(p)
-	if err != nil {
+	st := f.state(id)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.needsRecovery {
+		release, err := f.mutationGuard(ctx, id, st)
+		if err != nil {
+			return Snapshot{}, err
+		}
+		defer func() { retErr = errors.Join(retErr, release()) }()
+	}
+	// Without writer ownership another process can change the file; always
+	// replay a fresh read-only view. Cached Load is reserved for the owner.
+	if err := f.ensureLoaded(ctx, id, st, st.writer == nil); err != nil {
 		return Snapshot{}, err
 	}
-	s, _, err := replay(data)
-	if err == nil && s.Metadata.ID != id {
-		err = ErrCorrupted
-	}
-	return s, err
+	return clone(st.snapshot), nil
 }
 func (f *FileStore) List(ctx context.Context) ([]Metadata, error) {
 	if err := ctx.Err(); err != nil {
@@ -230,18 +406,24 @@ func (f *FileStore) List(ctx context.Context) ([]Metadata, error) {
 	}
 	out := []Metadata{}
 	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 		p := filepath.Join(f.dir, entry.Name())
 		mu := pathLock(p)
 		mu.Lock()
-		data, err := readFile(p)
+		data, err := f.read(p)
 		var s Snapshot
 		if err == nil {
 			s, _, err = replay(data)
 		}
 		mu.Unlock()
+		if errors.Is(err, ErrNotFound) {
+			continue // another process may have deleted it after ReadDir
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -250,22 +432,35 @@ func (f *FileStore) List(ctx context.Context) ([]Metadata, error) {
 		}
 		out = append(out, s.Metadata)
 	}
-	return out, nil
+	return out, ctx.Err()
 }
-func (f *FileStore) Delete(ctx context.Context, id string) error {
+func (f *FileStore) Delete(ctx context.Context, id string) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	p := f.path(id)
-	mu := pathLock(p)
-	mu.Lock()
-	defer mu.Unlock()
-	err := os.Remove(p)
+	st := f.state(id)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// Even this store's own active lifecycle lease prevents Delete.
+	if st.writer != nil {
+		return ErrInUse
+	}
+	release, err := f.mutationGuard(ctx, id, st)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, release()) }()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err = os.Remove(f.path(id))
 	if errors.Is(err, os.ErrNotExist) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
 	}
+	st.loaded = false
+	st.needsRecovery = false
 	return syncDirectory(f.dir)
 }

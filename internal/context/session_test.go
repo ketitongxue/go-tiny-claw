@@ -1,6 +1,7 @@
 package context
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -13,7 +14,7 @@ import (
 
 func TestWorkingMemoryKeepsCompleteParallelToolTurn(t *testing.T) {
 	s := NewSession("chat", t.TempDir())
-	s.Append(
+	s.Append(context.Background(),
 		schema.Message{Role: schema.RoleUser, Content: "old task"},
 		schema.Message{Role: schema.RoleAssistant, Content: "old answer"},
 		schema.Message{Role: schema.RoleUser, Content: "inspect"},

@@ -162,7 +162,7 @@ func TestConversationsStayOrderedAndIndependent(t *testing.T) {
 					return ctx.Err()
 				}
 			}
-			current.Append(schema.Message{Role: schema.RoleAssistant, Content: "response"})
+			current.Append(ctx, schema.Message{Role: schema.RoleAssistant, Content: "response"})
 			return nil
 		})
 	})

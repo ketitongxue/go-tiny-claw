@@ -1123,7 +1123,11 @@ claw -mode demo -resume <session-id> -prompt "继续刚才的任务"
 claw session delete <session-id> # 只删 Session，不删代码、WorkDir 或 Trace
 ```
 
-新 Demo 使用随机 ID；飞书按 ChatID 自动恢复。Resume 使用保存的 provider/model，不随默认模型改变。WorkDir 不存在会报错；凭据由现有 AuthManager 重新解析/刷新，Session 不保存任何认证 Token。一个 Agent Home 只应由一个运行进程使用（暂不支持跨进程并发修改同一 Session）。
+新 Demo 使用随机 ID；飞书按 ChatID 自动恢复。Resume 使用保存的 provider/model，不随默认模型改变。WorkDir 不存在会报错；凭据由现有 AuthManager 重新解析/刷新，Session 不保存任何认证 Token。
+
+**M5.1 Durable Runtime Hardening**：Session Store 使用 **single-writer process ownership**。macOS / Linux 上以 `<SHA256(SessionID)>.lock` 的 OS `flock` 持有写权限；Demo 持有到运行返回，飞书 chat worker 持有到退出。另一进程对活动 Session 的 Resume / Append / Usage / Delete 会明确报错 `session is currently in use by another claw process`，只读 `sessions` / `session show` 可并发使用。进程崩溃后 OS 自动释放锁，不需要删除残留 `.lock` 文件，也不要手工删除它。此锁不覆盖 AuthStore / OAuth refresh，也不是安全边界。
+
+持有 writer ownership 时，Create 直接初始化 Snapshot / Offset 缓存，首次 Resume 只重放一次；后续 Append 只验证和编码新事件，不重新读取历史 JSONL。检测到文件 size / identity / mtime 变化会重新验证；尾部 torn event 可恢复，中间损坏仍报错。写入、Sync、Close 成功后才发布缓存。Persistence 继承任务 Context；取消阻止尚未开始的写入，已经开始的提交先完成或恢复一致状态。每轮 Turn Span 独立结束一次，不在长 Run 中累积 defer。JSONL schema 保持 v1，ContextBuilder / Model Pinning 行为不变。
 
 ---
 
@@ -1542,11 +1546,15 @@ go run ./cmd/claw \
 go test ./...
 ```
 
-静态检查：
+Race / 静态检查与 Session Store 性能观测：
 
 ```bash
+go test -race ./...
 go vet ./...
+go test -bench=FileStore -benchmem ./internal/sessionstore
 ```
+
+FileStore Benchmark 比较 100 / 1000 条历史消息的单次 Append（包含 fsync）；不设绝对耗时 SLA。确定性测试另外验证 fast path 不读取完整历史，并覆盖跨进程冲突、活动 Session 只读访问及 SIGKILL 后锁释放。M5.1 变更与人工验收见 [M5.1 Report](docs/M5.1-report.md)。
 
 OAuth/JWKS/模型发现/SSE 测试默认全为 mock，不打开浏览器。显式人工 OAuth 集成测试（使用临时 Agent Home，不覆盖正常凭据）：
 

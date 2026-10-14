@@ -461,7 +461,13 @@ func (b *FeishuBot) rememberMessage(key string) {
 
 func (b *FeishuBot) runChat(worker *chatWorker) {
 	defer b.workers.Done()
+	defer func() {
+		if err := worker.session.Close(); err != nil {
+			log.Printf("[Feishu] 释放 Session writer lock 失败: %v", err)
+		}
+	}()
 	var runner agentRunner
+	sessionResolved := b.resolveSession == nil
 	for {
 		select {
 		case <-b.ctx.Done():
@@ -471,13 +477,14 @@ func (b *FeishuBot) runChat(worker *chatWorker) {
 				return
 			}
 			if runner == nil {
-				if b.resolveSession != nil {
+				if !sessionResolved {
 					sess, err := b.resolveSession(b.ctx, worker.chatID)
 					if err != nil {
 						worker.reporter.OnMessage(b.ctx, fmt.Sprintf("❌ Session 恢复失败: %v", err))
 						continue
 					}
 					worker.session = sess
+					sessionResolved = true
 				}
 				if b.runtimeFactory != nil {
 					eng, err := b.runtimeFactory(b.ctx, worker.session, worker.reporter)
@@ -494,7 +501,7 @@ func (b *FeishuBot) runChat(worker *chatWorker) {
 				worker.reporter.OnMessage(b.ctx, "❌ 无法创建会话引擎")
 				continue
 			}
-			if err := worker.session.Append(schema.Message{Role: schema.RoleUser, Content: prompt}); err != nil {
+			if err := worker.session.Append(b.ctx, schema.Message{Role: schema.RoleUser, Content: prompt}); err != nil {
 				worker.reporter.OnMessage(b.ctx, fmt.Sprintf("❌ Session 保存失败: %v", err))
 				continue
 			}

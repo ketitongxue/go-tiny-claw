@@ -45,6 +45,9 @@ func contextLimit(err error) bool {
 	return strings.Contains(s, "context_length_exceeded") || strings.Contains(s, "context window exceeded")
 }
 func (e *AgentEngine) generate(ctx context.Context, system schema.Message, history, view []schema.Message, tools []schema.ToolDefinition, span *observability.Span) (*schema.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	resp, err := e.provider.Generate(ctx, view, tools)
 	if contextLimit(err) {
 		log.Printf("[Context] Provider context limit; retrying once with conservative budget")
@@ -54,6 +57,9 @@ func (e *AgentEngine) generate(ctx context.Context, system schema.Message, histo
 		built, buildErr := e.buildContext(system, history, tools, span, spec)
 		if buildErr != nil {
 			return nil, buildErr
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		resp, err = e.provider.Generate(ctx, built.Messages, tools)
 	}

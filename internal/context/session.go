@@ -2,13 +2,16 @@ package context
 
 import (
 	stdctx "context"
-	"github.com/ketitongxue/go-tiny-claw/internal/sessionstore"
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
+	"github.com/ketitongxue/go-tiny-claw/internal/sessionstore"
 )
+
+var ErrSessionClosed = errors.New("session is closed")
 
 // Session 代表了一次持续的人机交互过程。它负责维护该会话的完整历史。
 type Session struct {
@@ -30,6 +33,9 @@ type Session struct {
 
 	// 存放此 Session 中所有的用户输入、大模型回复和工具调用结果
 	store   sessionstore.Store
+	writer  sessionstore.SessionLock
+	closed  bool
+	onClose func()
 	history []schema.Message
 	mu      sync.RWMutex // 读写锁，防止并发读写历史时发生 Data Race
 }
@@ -76,9 +82,18 @@ func (s *Session) ModelAttributes() map[string]string {
 	defer s.mu.RUnlock()
 	return map[string]string{"provider_id": s.ProviderID, "model_id": s.ModelID, "billing_mode": string(s.BillingMode), "auth_type": s.AuthType}
 }
-func (s *Session) RecordUsage(prompt int, completion int, billing provider.UsageBilling) error {
+func (s *Session) RecordUsage(ctx stdctx.Context, prompt int, completion int, billing provider.UsageBilling) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrSessionClosed
+	}
 	u := s.usageLocked()
 	u.PromptTokens += prompt
 	u.CompletionTokens += completion
@@ -89,7 +104,7 @@ func (s *Session) RecordUsage(prompt int, completion int, billing provider.Usage
 	e := sessionstore.NewEvent("usage")
 	e.Usage = &u
 	if s.store != nil {
-		if err := s.store.Append(stdctx.Background(), s.ID, e); err != nil {
+		if err := s.store.Append(ctx, s.ID, e); err != nil {
 			return err
 		}
 	}
@@ -100,7 +115,9 @@ func (s *Session) RecordUsage(prompt int, completion int, billing provider.Usage
 	s.UpdatedAt = e.Timestamp
 	return nil
 }
-func (s *Session) MarkCostUnknown() error { return s.RecordUsage(0, 0, provider.UsageBilling{}) }
+func (s *Session) MarkCostUnknown(ctx stdctx.Context) error {
+	return s.RecordUsage(ctx, 0, 0, provider.UsageBilling{})
+}
 func (s *Session) UsageSnapshot() UsageTotals {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -125,17 +142,44 @@ func NewSession(id string, workDir string) *Session {
 	}
 }
 
-// Append 线程安全地向 Session 中追加消息
-func (s *Session) Append(msgs ...schema.Message) error {
+// Close ends the session's runtime ownership after its callers have stopped.
+// Mutations and Release are serialized so a writer is never released mid-commit.
+func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	if s.onClose != nil {
+		s.onClose()
+	}
+	if s.writer != nil {
+		return s.writer.Release()
+	}
+	return nil
+}
+
+// Append 线程安全地向 Session 中追加消息
+func (s *Session) Append(ctx stdctx.Context, msgs ...schema.Message) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.closed {
+		return ErrSessionClosed
+	}
 	events := make([]sessionstore.Event, len(msgs))
 	for i := range msgs {
 		events[i] = sessionstore.NewEvent("message")
 		events[i].Message = &msgs[i]
 	}
 	if s.store != nil {
-		if err := s.store.Append(stdctx.Background(), s.ID, events...); err != nil {
+		if err := s.store.Append(ctx, s.ID, events...); err != nil {
 			return err
 		}
 	}

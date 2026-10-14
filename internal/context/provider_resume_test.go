@@ -88,10 +88,14 @@ func TestProviderResumeResolvesCredentials(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if err := sess.Close(); err != nil {
+				t.Fatal(err)
+			}
 			resumed, err := ctxpkg.NewSessionService(fs).Resume(ctx, "s")
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { _ = resumed.Close() })
 			p, _, err := setup().Create(ctx, resumed.ModelRef())
 			if err != nil {
 				t.Fatal(err)
