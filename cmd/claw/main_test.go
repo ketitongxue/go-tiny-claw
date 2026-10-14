@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/executor"
+	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 )
 
@@ -121,6 +121,8 @@ func TestSandboxMissingImageFailsClosed(t *testing.T) {
 }
 
 func TestRunSandboxFailureStopsBeforeModel(t *testing.T) {
+	t.Setenv("CLAW_HOME", t.TempDir())
+	t.Setenv("ZAI_CODING_CN_API_KEY", "")
 	t.Setenv("ZHIPU_API_KEY", "offline-placeholder")
 	installDockerStub(t, "echo 'daemon unavailable' >&2; exit 1")
 	var output bytes.Buffer
@@ -154,6 +156,7 @@ func TestLocalModeWarnsWithoutCheckingDocker(t *testing.T) {
 }
 
 func TestCheckConfigDoesNotStartModelOrCreateWorkspace(t *testing.T) {
+	t.Setenv("CLAW_HOME", t.TempDir())
 	for _, key := range []string{"ZHIPU_API_KEY", "FEISHU_APP_ID", "FEISHU_APP_SECRET"} {
 		t.Setenv(key, "offline-placeholder")
 	}
@@ -186,6 +189,8 @@ func TestSessionFactoryRunsExistingToolsAndSubagent(t *testing.T) {
 
 func runSessionFactoryRegression(t *testing.T, opts options, executors sessionExecutors) {
 	t.Helper()
+	opts.modelInfo = provider.ModelInfo{ProviderID: "zai-coding-cn", ID: "glm-5.3", ToolCalling: true, BillingMode: provider.BillingSubscription}
+	opts.authType = "api_key"
 	workDir := opts.workDir
 	if err := os.WriteFile(filepath.Join(workDir, "AGENTS.md"), []byte("factory-workspace-guide"), 0o600); err != nil {
 		t.Fatal(err)
@@ -268,8 +273,11 @@ func runSessionFactoryRegression(t *testing.T, opts options, executors sessionEx
 	if err := eng.Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
 	}
-	if input, output, cost := sess.UsageTotals(); input != 90 || output != 18 || math.Abs(cost-0.001224) > 1e-12 {
+	if input, output, cost := sess.UsageTotals(); input != 90 || output != 18 || cost != 0 {
 		t.Fatalf("main + subagent accounting = %d/%d/%f", input, output, cost)
+	}
+	if usage := sess.UsageSnapshot(); usage.CostKnown || usage.BillingMode != provider.BillingSubscription {
+		t.Fatalf("subscription mispriced: %+v", usage)
 	}
 	if input, output, cost := other.UsageTotals(); input != 0 || output != 0 || cost != 0 {
 		t.Fatal("usage leaked to another session")
@@ -277,6 +285,15 @@ func runSessionFactoryRegression(t *testing.T, opts options, executors sessionEx
 	traces, err := filepath.Glob(filepath.Join(workDir, ".claw", "traces", "*.json"))
 	if err != nil || len(traces) != 1 {
 		t.Fatalf("trace export: %v, %v", traces, err)
+	}
+	data, err := os.ReadFile(traces[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{`"provider_id": "zai-coding-cn"`, `"model_id": "glm-5.3"`, `"billing_mode": "subscription"`, `"auth_type": "api_key"`} {
+		if !strings.Contains(string(data), value) {
+			t.Errorf("missing trace metadata %s", value)
+		}
 	}
 }
 

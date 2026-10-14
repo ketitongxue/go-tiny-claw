@@ -8,11 +8,14 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/app"
+	"github.com/ketitongxue/go-tiny-claw/internal/config"
 	"github.com/ketitongxue/go-tiny-claw/internal/eval"
 	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 )
 
 func main() {
+	model := flag.String("model", "", "模型 provider/model；默认读取全局 config.json")
 	sandbox := flag.String("sandbox", executor.ModeAuto, "执行后端：auto、docker、local（不安全）")
 	image := flag.String("sandbox-image", executor.DefaultImage, "预先构建的 Sandbox 镜像")
 	flag.Parse()
@@ -21,10 +24,32 @@ func main() {
 	if *sandbox == executor.ModeLocal {
 		log.Print("WARNING: Benchmark 使用宿主 LocalExecutor（UNSAFE），命令拥有当前用户权限；workdir 不是隔离边界。请勿执行不可信代码。")
 	}
-	if os.Getenv("ZHIPU_API_KEY") == "" {
-		log.Fatal("请先导出 ZHIPU_API_KEY 环境变量进行跑分测试")
+	home, err := config.AgentHomeDir()
+	if err != nil {
+		log.Fatal(err)
 	}
-
+	paths, err := config.NewPaths(home)
+	if err != nil {
+		log.Fatal(err)
+	}
+	runtime, err := app.Load(paths, os.Getenv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ref, legacy, err := config.ResolveSelectedModel(*model, runtime.Config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if legacy {
+		log.Printf("WARNING: 未限定的 -model 已弃用；请使用 -model %s", ref)
+	}
+	if err := paths.ValidateWorkspace("workspace"); err != nil {
+		log.Fatal(err)
+	}
+	_, authInfo, err := runtime.Manager.Inspect(ctx, ref)
+	if err != nil {
+		log.Fatal(err)
+	}
 	exec, err := executor.NewConfigured(ctx, *sandbox, *image, executor.CodingPolicy())
 	if err != nil {
 		log.Fatal(err)
@@ -54,8 +79,10 @@ func main() {
 		},
 	}
 
-	// 启动跑分执行器！
-	// 我们选用国内极其廉价但能力不错的 glm-4.5-air 跑分，省点钱。
-	runner := eval.NewBenchmarkRunner("glm-5.2", exec)
+	p, info, err := runtime.Manager.Create(ctx, ref)
+	if err != nil {
+		log.Fatal(err)
+	}
+	runner := eval.NewBenchmarkRunner(p, info, string(authInfo.Type), exec)
 	runner.RunSuite(ctx, testcases)
 }

@@ -17,5 +17,11 @@
 
 # Generated Agent workspace and runtime state
 /workspace/
-**/.claw/traces/
-**/.claw/sessions/
+# Global .claw/ credentials/config and workspace runtime state; skills stay trackable
+**/.claw/*
+!**/.claw/skills/
+!**/.claw/skills/**
+auth.json
+host.json
+host.json.lock/
+openai-models.json

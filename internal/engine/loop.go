@@ -48,6 +48,9 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	ctx, rootSpan := observability.StartSpan(ctx, "Agent.Run")
 	rootSpan.AddAttribute("SessionID", session.ID)
 	rootSpan.AddAttribute("WorkDir", session.WorkDir)
+	for key, value := range session.ModelAttributes() {
+		rootSpan.AddAttribute(key, value)
+	}
 
 	// defer 保证在引擎退出时，无论成功失败，都能结束根 Span 并导出 Trace 报告
 	defer func() {

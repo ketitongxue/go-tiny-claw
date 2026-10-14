@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 )
 
@@ -17,36 +18,86 @@ type Session struct {
 	// 【新增】用于统计该 Session 累计消耗的资源
 	TotalPromptTokens     int
 	TotalCompletionTokens int
-	TotalCostCNY          float64
+	TotalEstimatedCost    float64 // consult CostKnown and Currency before displaying
+	ProviderID            string
+	ModelID               string
+	AuthType              string
+	BillingMode           provider.BillingMode
+	CostKnown             bool
+	Currency              string
 
 	// 存放此 Session 中所有的用户输入、大模型回复和工具调用结果
 	history []schema.Message
 	mu      sync.RWMutex // 读写锁，防止并发读写历史时发生 Data Race
 }
 
-// RecordUsage 是一个给外部 Tracker 调用的辅助方法，用于累加账单
-func (s *Session) RecordUsage(prompt int, completion int, cost float64) {
+type UsageTotals struct {
+	PromptTokens, CompletionTokens int
+	EstimatedCost                  float64
+	CostKnown                      bool
+	Currency                       string
+	BillingMode                    provider.BillingMode
+}
+
+func (u UsageTotals) Billing() provider.UsageBilling {
+	return provider.UsageBilling{Mode: u.BillingMode, EstimatedCost: u.EstimatedCost, CostKnown: u.CostKnown, Currency: u.Currency}
+}
+func (s *Session) SetModelInfo(model provider.ModelInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ProviderID = model.ProviderID
+	s.ModelID = model.ID
+	s.BillingMode = model.BillingMode
+	if s.BillingMode == "" {
+		s.BillingMode = provider.BillingUnknown
+	}
+	s.CostKnown = model.BillingMode == provider.BillingAPI && model.Pricing != nil && model.Pricing.Currency != ""
+	if s.CostKnown {
+		s.Currency = model.Pricing.Currency
+	}
+}
+func (s *Session) SetAuthType(authType string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.AuthType = authType
+}
+func (s *Session) ModelAttributes() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return map[string]string{"provider_id": s.ProviderID, "model_id": s.ModelID, "billing_mode": string(s.BillingMode), "auth_type": s.AuthType}
+}
+func (s *Session) RecordUsage(prompt int, completion int, billing provider.UsageBilling) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.TotalPromptTokens += prompt
 	s.TotalCompletionTokens += completion
-	s.TotalCostCNY += cost
+	s.CostKnown = s.CostKnown && billing.CostKnown
+	if billing.CostKnown {
+		s.TotalEstimatedCost += billing.EstimatedCost
+	}
+}
+func (s *Session) MarkCostUnknown() { s.mu.Lock(); defer s.mu.Unlock(); s.CostKnown = false }
+func (s *Session) UsageSnapshot() UsageTotals {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return UsageTotals{PromptTokens: s.TotalPromptTokens, CompletionTokens: s.TotalCompletionTokens, EstimatedCost: s.TotalEstimatedCost, CostKnown: s.CostKnown, Currency: s.Currency, BillingMode: s.BillingMode}
 }
 
 // UsageTotals returns a consistent snapshot while parallel subagents record usage.
 func (s *Session) UsageTotals() (prompt int, completion int, cost float64) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.TotalPromptTokens, s.TotalCompletionTokens, s.TotalCostCNY
+	return s.TotalPromptTokens, s.TotalCompletionTokens, s.TotalEstimatedCost
 }
 
 func NewSession(id string, workDir string) *Session {
 	return &Session{
-		ID:        id,
-		WorkDir:   workDir,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-		history:   make([]schema.Message, 0),
+		ID:          id,
+		WorkDir:     workDir,
+		BillingMode: provider.BillingUnknown,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+		history:     make([]schema.Message, 0),
 	}
 }
 

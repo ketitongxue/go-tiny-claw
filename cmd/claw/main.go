@@ -13,12 +13,16 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/app"
+	"github.com/ketitongxue/go-tiny-claw/internal/auth"
+	"github.com/ketitongxue/go-tiny-claw/internal/config"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
 	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 	"github.com/ketitongxue/go-tiny-claw/internal/feishu"
 	"github.com/ketitongxue/go-tiny-claw/internal/observability"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
+	"github.com/ketitongxue/go-tiny-claw/internal/provider/openai"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 	"github.com/ketitongxue/go-tiny-claw/internal/tools"
 )
@@ -32,6 +36,8 @@ type options struct {
 	mode, workDir, model, prompt string
 	sandbox, sandboxImage        string
 	thinking, plan, checkConfig  bool
+	modelInfo                    provider.ModelInfo
+	authType                     string
 }
 
 func parseOptions(args []string, output io.Writer) (options, error) {
@@ -40,7 +46,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	fs.SetOutput(output)
 	fs.StringVar(&opts.mode, "mode", "feishu", "运行模式：feishu（长连接）或 demo（原终端演示）")
 	fs.StringVar(&opts.workDir, "workdir", "workspace", "工具、会话、技能和 Trace 共用的工作区")
-	fs.StringVar(&opts.model, "model", "glm-5.3", "智谱模型名称")
+	fs.StringVar(&opts.model, "model", "", "模型 provider/model；默认读取全局 config.json")
 	fs.StringVar(&opts.prompt, "prompt", demoPrompt, "demo 模式下执行的指令")
 	fs.StringVar(&opts.sandbox, "sandbox", executor.ModeAuto, "Bash 执行后端：auto（仅 Docker，失败拒绝启动）、docker、local（不安全）")
 	fs.StringVar(&opts.sandboxImage, "sandbox-image", executor.DefaultImage, "预先构建的 Docker Sandbox 镜像")
@@ -62,8 +68,14 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	if err := executor.ValidateImage(opts.sandboxImage); err != nil {
 		return opts, err
 	}
-	if strings.TrimSpace(opts.workDir) == "" || strings.TrimSpace(opts.model) == "" {
-		return opts, fmt.Errorf("workdir 和 model 不能为空")
+	modelExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "model" {
+			modelExplicit = true
+		}
+	})
+	if strings.TrimSpace(opts.workDir) == "" || modelExplicit && strings.TrimSpace(opts.model) == "" {
+		return opts, fmt.Errorf("workdir 和显式 model 不能为空")
 	}
 	if opts.mode == "demo" && strings.TrimSpace(opts.prompt) == "" {
 		return opts, fmt.Errorf("demo 指令不能为空")
@@ -77,7 +89,7 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 }
 
 func validateEnvironment(mode string, getenv func(string) string) error {
-	required := []string{"ZHIPU_API_KEY"}
+	var required []string
 	if mode == "feishu" {
 		required = append(required, "FEISHU_APP_ID", "FEISHU_APP_SECRET")
 	}
@@ -128,7 +140,8 @@ func newSessionEngine(p provider.LLMProvider, sess *ctxpkg.Session, reporter eng
 		explorerRegistry.Use(middleware)
 	}
 
-	tracked := observability.NewCostTracker(p, opts.model, sess)
+	tracked := observability.NewCostTracker(p, opts.modelInfo, sess)
+	sess.SetAuthType(opts.authType)
 	eng := engine.NewAgentEngine(tracked, registry, opts.thinking, opts.plan)
 	registry.Register(tools.NewSubagentTool(eng, explorerRegistry, reporter))
 	return eng
@@ -178,6 +191,9 @@ func configureExecutors(ctx context.Context, opts options, output io.Writer) (se
 }
 
 func run(ctx context.Context, args []string, output io.Writer) error {
+	if handled, err := dispatchCommand(ctx, args, commandIO{input: os.Stdin, output: output}); handled {
+		return err
+	}
 	opts, err := parseOptions(args, output)
 	if err != nil {
 		return err
@@ -185,13 +201,45 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err := validateEnvironment(opts.mode, os.Getenv); err != nil {
 		return err
 	}
+	runtime, err := loadRuntime()
+	if err != nil {
+		return err
+	}
+	ref, legacy, err := config.ResolveSelectedModel(opts.model, runtime.Config)
+	if err != nil {
+		return err
+	}
+	if legacy {
+		fmt.Fprintf(output, "WARNING: -model %s 已弃用；请使用 -model %s\n", opts.model, ref)
+	}
+	opts.model = ref.String()
+	if err := runtime.Paths.ValidateWorkspace(opts.workDir); err != nil {
+		return err
+	}
+	if opts.checkConfig && ref.ProviderID == "openai" {
+		if err := checkOpenAIOAuthConfig(ctx, runtime, output); err != nil {
+			return err
+		}
+	}
+	model, credentialInfo, err := runtime.Manager.Inspect(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("所选/默认模型 %s 不可用: %w。请运行 claw auth login 或指定 -model", ref, err)
+	}
+	opts.modelInfo = model
+	opts.authType = string(credentialInfo.Type)
 	if info, err := os.Stat(opts.workDir); err == nil && !info.IsDir() {
 		return fmt.Errorf("工作区不是目录: %s", opts.workDir)
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("检查工作区失败: %w", err)
 	}
 	if opts.checkConfig {
-		fmt.Fprintf(output, "本地配置检查通过：mode=%s model=%s workspace=%s sandbox=%s sandbox-image=%s\n尚未验证 Sandbox、凭证有效性、网络连接或飞书收发消息。\n", opts.mode, opts.model, opts.workDir, opts.sandbox, opts.sandboxImage)
+		fmt.Fprintf(output, "本地配置检查通过：mode=%s workspace=%s sandbox=%s sandbox-image=%s\nProvider: %s\nModel: %s\nAuth: %s\nCredential: available (%s)\nConfig: %s\n", opts.mode, opts.workDir, opts.sandbox, opts.sandboxImage, ref.ProviderID, ref.ModelID, credentialInfo.Type, credentialInfo.Source, runtime.Paths.Config)
+		if credentialInfo.RefreshBlocked {
+			fmt.Fprintln(output, "OAuth refresh deferred until earliest_refresh_at（本检查未联网）。")
+		} else if credentialInfo.NeedsRefresh {
+			fmt.Fprintln(output, "OAuth token 已过期或即将过期；运行时需刷新（本检查未联网）。")
+		}
+		fmt.Fprintln(output, "尚未验证 Sandbox、凭证有效性、网络连接或飞书收发消息。")
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -204,7 +252,11 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	p := provider.NewZhipuOpenAIProvider(opts.model)
+	p, model, err := runtime.Manager.Create(ctx, ref)
+	if err != nil {
+		return err
+	}
+	opts.modelInfo = model
 	if opts.mode == "feishu" {
 		bot, err := feishu.NewFeishuBotWithFactory(opts.workDir, func(sess *ctxpkg.Session, reporter engine.Reporter) *engine.AgentEngine {
 			return newSessionEngine(p, sess, reporter, opts, executors)
@@ -224,8 +276,50 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err := eng.Run(ctx, sess, reporter); err != nil {
 		return err
 	}
-	input, completion, cost := sess.UsageTotals()
-	log.Printf("会话 %s | Input Tokens: %d | Output Tokens: %d | 估算费用 (CNY): ¥%.6f", sess.ID, input, completion, cost)
+	usage := sess.UsageSnapshot()
+	log.Printf("会话 %s | Input Tokens: %d | Output Tokens: %d | %s", sess.ID, usage.PromptTokens, usage.CompletionTokens, usage.Billing())
+	return nil
+}
+
+func checkOpenAIOAuthConfig(ctx context.Context, r *app.Runtime, output io.Writer) error {
+	fmt.Fprintln(output, "OpenAI OAuth: dynamic registration supported (no client ID environment variable required)")
+	stored, err := r.Auth.StoredCredential(ctx, "openai")
+	if err != nil && !errors.Is(err, auth.ErrNotFound) {
+		return err
+	}
+	info, _ := r.Auth.Inspect(ctx, "openai")
+	if info.Type == auth.CredentialAPIKey {
+		fmt.Fprintln(output, "Existing OAuth credential: none (API key configured)\nHost ID: not required for API key; initialized on OAuth login")
+		return nil
+	}
+	hostID, hostErr := r.Hosts.OpenAIHostID(ctx)
+	if hostErr != nil {
+		return hostErr
+	}
+	fmt.Fprintf(output, "Host ID: available (%s; value not displayed)\n", r.Paths.Host)
+	if errors.Is(err, auth.ErrNotFound) {
+		fmt.Fprintln(output, "Existing OAuth credential: none")
+		return nil
+	}
+	if c, ok := stored.(auth.OAuthCredential); ok {
+		if err := openai.CheckCredential(c); err != nil {
+			fmt.Fprintln(output, "Existing OAuth credential: incomplete; re-login required")
+			return nil
+		}
+		if c.ExtAgentHostID != hostID {
+			return errors.New("OpenAI OAuth host ID does not match this installation; restore host.json or logout before registering again")
+		}
+		planUsage := "disabled"
+		if c.HasScope(openai.PlanScope) {
+			planUsage = "enabled"
+		}
+		fmt.Fprintf(output, "Existing OAuth credential: connected; ChatGPT Plan Usage: %s\n", planUsage)
+		if r.OpenAICatalogError != nil {
+			fmt.Fprintln(output, "OAuth model cache: invalid; run claw models to refresh")
+		}
+	} else {
+		fmt.Fprintln(output, "Existing OAuth credential: none (API key configured)")
+	}
 	return nil
 }
 

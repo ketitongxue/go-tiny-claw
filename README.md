@@ -29,7 +29,10 @@
 | 能力                                  | 当前状态        |
 | ----------------------------------- | ----------- |
 | ReAct Agent Loop                    | ✅           |
-| OpenAI-compatible Provider          | ✅           |
+| OpenAI-compatible Provider          | ✅ 配置扩展    |
+| OpenAI Responses / API Key          | ✅           |
+| ChatGPT OAuth / Dynamic Registration / PKCE / Refresh | ✅ 默认动态注册 |
+| 机器级默认模型 / Model Registry          | ✅           |
 | 智谱 Coding API                       | ✅ 默认        |
 | 文件读取 / 写入 / 编辑                      | ✅           |
 | Bash                                | ✅           |
@@ -176,7 +179,18 @@ go-tiny-claw/
 │   │   ├── trace.go
 │   │   └── tracker.go
 │   │
+│   ├── app/                      # Provider/Auth/Config 装配入口
+│   ├── auth/                     # Credential Store / PKCE / Refresh
+│   ├── config/                   # Global Agent Home / config / custom models
+│   ├── fileutil/                 # 原子 JSON 写入
 │   ├── provider/
+│   │   ├── interface.go
+│   │   ├── manager.go
+│   │   ├── registry.go
+│   │   ├── model_registry.go
+│   │   ├── openai/               # Responses
+│   │   ├── zai/                  # Coding Plan China
+│   │   └── compatible/           # Generic Chat Completions
 │   ├── schema/
 │   └── tools/
 │
@@ -197,7 +211,7 @@ go-tiny-claw/
 
 - Go 1.26.2
 - Bash
-- 智谱 API Key
+- 所选 Provider 的凭据（ZAI/OpenAI API Key，或 ChatGPT OAuth + Plan Usage 授权；本地 none Provider 不需要）
 - Docker / Docker Desktop，推荐
 - 飞书应用凭据，使用 Feishu 模式时需要
 
@@ -253,35 +267,156 @@ git push
 
 远端地址为 `https://github.com/ketitongxue/go-tiny-claw.git`，可通过 `git remote -v` 查看。HTTPS 推送需要仓库写入权限和有效认证；使用 GitHub CLI 时，可通过 `gh auth login` 登录，使用 `gh auth setup-git` 配置 Git 认证，不要把 Token 或 API Key 写入代码。
 
-`.gitignore` 排除了本地二进制、构建/测试产物、`.DS_Store`、`.env` 密钥文件、`workspace/` 以及 `.claw/traces/`、`.claw/sessions/` 运行数据。示例环境配置和 `.claw/skills/` 仍可提交。已有本地文件会保留，但不会随 `git add .` 上传。
+`.gitignore` 排除了本地二进制、构建/测试产物、`.DS_Store`、`.env`、`auth.json`、`workspace/` 和 `.claw/` 配置/运行数据；示例环境配置和 `.claw/skills/` 仍可提交。全局 `~/.claw/` 本来就在仓库外，不要将其复制进项目。
 
 ---
 
-## 2. 配置模型
+## 2. Provider、Auth 与 Model
 
-当前默认 Provider 使用智谱 OpenAI-compatible Coding API：
-
-```text
-https://open.bigmodel.cn/api/coding/paas/v4
-```
-
-配置 API Key：
-
-```bash
-export ZHIPU_API_KEY="your-api-key"
-```
-
-当前 `claw` 默认模型：
+所有模型统一使用 **`provider/model`**。Provider、Credential、Model 和机器级默认选择互相独立：
 
 ```text
-glm-5.3
+CLI → ModelRef → ProviderManager → LLMProvider → AgentEngine
+                     ├ ProviderRegistry (definition + factory)
+                     ├ ModelRegistry (API-key / account-bound OAuth / custom catalog)
+                     └ AuthManager (store → environment → refresh)
 ```
 
-也可以启动时指定：
+内置 Provider：`openai`（Responses API，API Key / OAuth）和 `zai-coding-cn`（智谱 Coding Plan China，Chat Completions）。其他 OpenAI-compatible 服务通过配置扩展，不需要改 Go 代码。
+
+### Global Agent Home 与 Workspace
+
+```text
+~/.claw/                         # 全局配置，不是 Agent 工作区
+├── config.json                  # 普通配置：default_model
+├── auth.json                    # API Key / OAuth / ID Token，0600，明文凭据
+├── host.json                    # 稳定 OpenAI installation Host ID，非凭据
+├── openai-models.json            # 绑定 OAuth 账号/注册的模型缓存，无 token
+└── models.json                  # 自定义 Provider / 模型目录
+
+<workspace>/.claw/               # 工作区资料，可被 Agent 访问
+├── skills/
+└── traces/
+```
+
+可用 `CLAW_HOME=/absolute/path` 显式指定全局目录（测试使用临时目录）。全局目录与工作区不能互相包含，启动时会拒绝这种配置；不要把凭据放进工作区或 Sandbox。详见 [Security](docs/security.md)。
+
+### ZAI Coding Plan China
 
 ```bash
--model glm-5.3
+export ZAI_CODING_CN_API_KEY="..."
+claw auth login zai-coding-cn --from-env   # 可选：保存到 AuthStore
+claw model set zai-coding-cn/glm-5.3
+claw -mode demo -model zai-coding-cn/glm-5.3
 ```
+
+Endpoint 为 `https://open.bigmodel.cn/api/coding/paas/v4`，由 `internal/provider/zai/` 管理。
+
+解析优先级：AuthStore → `ZAI_CODING_CN_API_KEY` → `ZHIPU_API_KEY`。`ZHIPU_API_KEY` 仅为 **legacy compatibility**；旧用户未创建配置时仍默认使用 `zai-coding-cn/glm-5.3`。临时兼容 `-model glm-5.3`，但会打印弃用警告。
+
+### OpenAI API Key
+
+```bash
+export OPENAI_API_KEY="..."
+claw auth login openai --method api-key --from-env
+# 也可在终端隐藏输入：claw auth login openai --method api-key
+claw models
+claw model set openai/gpt-5.2
+```
+
+API Key 使用 Platform Responses API，计费模式为 `api`。飞书模式只额外要求飞书环境变量，不再强制要求智谱 Key。
+
+### OpenAI / Sign in with ChatGPT
+
+本地开源客户端默认走 **Dynamic Client Registration**，不需要手动配置 client ID，也不借用 Codex 或其他 CLI 的凭据。若尚未安装命令，可运行 `go install ./cmd/claw` 并将 Go bin 目录加入 PATH，或用 `go run ./cmd/claw` 替代 `claw`。
+
+```bash
+claw auth login openai                   # 默认 Sign in with ChatGPT
+# 在浏览器登录 ChatGPT，选择账号/Workspace，授权 ChatGPT Plan Usage
+claw models                             # 在线刷新此账号实际授权的模型目录
+claw model set openai/<actual-model>     # 用列表中的实际 slug，不要照抄占位符
+claw -mode demo -sandbox=docker -prompt "读取当前工作区文件，并总结目录结构"
+```
+
+Docker 镜像需要预先构建（见下文）。也支持显式 `claw auth login openai --method oauth`。
+
+首次请求 `https://auth.openai.com/api/accounts/authorize`，使用 `dynamic_agent_client`、固定应用名 `go-tiny-claw`、全局持久 Host ID、PKCE(S256)、独立 state/nonce，以及 `resource.invoke` / `chatgpt.tokens.use.direct` 等 scopes。callback 绑定 `127.0.0.1` 的动态端口和 `/auth/callback`；验证 state 后必须收到 issued client ID。Token exchange 使用 issued ID 和完全相同的 redirect URI，不发送 client secret。ID Token 经 OpenAI JWKS 验证签名、issuer、issued-client audience、过期时间和 nonce 后才保存身份。
+
+重复登录复用已保存的 issued client ID、Host ID 和 ID Token hint；callback 换 client ID 或 ID Token 换 subject 都会拒绝覆盖。要主动切换账号，请先 `claw auth logout openai`（保留 Host ID）。`OPENAI_OAUTH_CLIENT_ID` 仅作为可选的预注册 **static-client override**，不是默认登录的前置条件；已有注册优先于 override。
+
+若未授予 `chatgpt.tokens.use.direct`，仍保存有效账号身份，但显示 **ChatGPT Plan Usage: disabled**，不发现模型、不进行订阅推理。重新登录授权，或显式改用 `--method api-key`；不会自动 fallback 到环境中的 API Key。
+
+OAuth 模型来自 Bearer token 认证的 `GET https://api.openai.com/v1/models`，只保留 `visibility=list`，以 `slug` 为 ID、`display_name` 为展示名；不会套用 API Key 静态目录。登录和 `claw models` 刷新全局账号绑定缓存，`model set`、启动和 `-check-config` 离线读取缓存。账号权限变化后请重新 `claw models`；缓存不能保证实时配额。
+
+订阅推理使用 `POST https://api.openai.com/v1/responses`，明确发送 `store=false`、`stream=true`，不使用 ChatGPT backend-api、`previous_response_id` 或 system input message。System Prompt 映射到 `instructions`，Working Memory 完整映射为 input/tool history。Provider 内部消费 SSE、聚合文本/工具调用，只有 `response.completed` 才成功；失败、未完成、断流或取消均报错。订阅限额/不可用错误明确提示，不自动花费 API Key 额度。当前不提供终端/飞书逐 token UI。
+
+兼容真实订阅接口省略 `Content-Type` 的 SSE：按有界正文格式检测，而非仅依赖响应头。若 `response.completed` 仅返回 `output: []` 摘要，则使用此前 `response.output_item.done` 的已完成文本/工具调用；不把未完成增量当成最终输出。非空终态输出优先，不重复拼接。
+
+SSH/headless 或浏览器打开失败时：
+
+```bash
+export OPENAI_OAUTH_REDIRECT_URI="http://127.0.0.1:1455/auth/callback"
+claw auth login openai --method oauth --manual
+```
+
+在私密交互中打开显示的授权地址，完成后粘贴**完整 final redirect URL**（即使浏览器无法连接该地址），不能只粘贴 code。手动模式移除 token/login hints，自动模式从不打印授权 URL。不要将授权 URL、callback URL 或凭据粘贴进日志/issue。
+
+每次模型请求前检查 token，按 Provider 串行刷新，尊重 `earliest_refresh_at`，原子保存 access/refresh token rotation、过期信息和 scopes。此锁仅覆盖同一进程；避免多个 claw 进程同时刷新同一账号。旧的仅含 AccountID/token 的 OAuth 记录可读取，但必须 logout 后重新完成验证注册。
+
+**真实服务状态说明：** mock OAuth/JWKS/模型/SSE 和 Docker 工具链有自动测试；真实浏览器授权、账号/Workspace 权限及订阅配额需要人工验收，不能仅凭 mock 测试保证 OpenAI 对每个账号开放此流程。
+
+### 机器级默认模型
+
+```bash
+claw auth login                         # 查看可登录 Provider
+claw auth logout openai                 # 仅删除 AuthStore；环境变量仍可能生效
+claw models                             # OAuth 在线账号目录；其他 Provider 使用现有静态目录
+claw model current
+claw model set zai-coding-cn/glm-5.3
+```
+
+启动选择优先级：`-model provider/model` → `config.json.default_model` → `zai-coding-cn/glm-5.3`。默认模型缺少凭据时明确报错，**不静默切换 Provider**。`model set` 在保存前离线校验模型、Provider、凭据和 ToolCalling；不可调用工具的模型不能作为主 Agent。
+
+```json
+{"default_model": "zai-coding-cn/glm-5.3"}
+```
+
+OpenAI OAuth 列表在线发现；OpenAI API Key、ZAI 和自定义 Provider 保持内置/配置目录。实际调用和配额仍由服务端决定。本阶段所有会话使用同一启动模型，没有飞书 `/model` 或 Session 级切换。
+
+### Custom OpenAI-compatible Providers
+
+编辑 `~/.claw/models.json`：
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "name": "Local Ollama",
+      "api": "openai-compatible",
+      "base_url": "http://localhost:11434/v1",
+      "auth": {"type": "none"},
+      "models": [
+        {"id": "qwen3-coder", "tool_calling": true, "reasoning": false, "billing": "unknown"}
+      ]
+    },
+    "company-ai": {
+      "name": "Company AI Gateway",
+      "api": "openai-compatible",
+      "base_url": "https://ai.example.com/v1",
+      "auth": {"type": "api_key", "env": "COMPANY_AI_API_KEY"},
+      "models": [{"id": "coder-large", "tool_calling": true}]
+    }
+  }
+}
+```
+
+```bash
+claw model set ollama/qwen3-coder
+# 企业网关：export COMPANY_AI_API_KEY="..."
+# 可选持久化：claw auth login company-ai --from-env
+```
+
+仅支持 `none` / `api_key` + env；AuthStore 中的 Key 优先于 env。不支持 literal key、custom OAuth 或 command credentials。Provider ID 必须匹配 `[a-z0-9][a-z0-9_-]*`；重复 ID/模型、覆盖内置 Provider、非法 env 名与非 HTTP(S) BaseURL 会报错。模型 ID 可包含 `/`，按第一个 `/` 拆分模型引用。`billing` 可为 `api`、`subscription`、`unknown`，省略即 unknown。修改后重启加载，不支持热加载。
 
 ---
 
@@ -659,7 +794,8 @@ Feishu 是当前默认入口。
 需要：
 
 ```bash
-export ZHIPU_API_KEY="..."
+# 配置所选 Provider 的凭据；此处以 ZAI 为例，也可改用 OpenAI 或自定义 Provider
+export ZAI_CODING_CN_API_KEY="..."
 
 export FEISHU_APP_ID="..."
 
@@ -1177,14 +1313,16 @@ TERM
 例如下面这些不会自动暴露：
 
 ```text
-ZHIPU_API_KEY
+OPENAI_API_KEY
+ZAI_CODING_CN_API_KEY
+ZHIPU_API_KEY（legacy）
 FEISHU_APP_SECRET
 GITHUB_TOKEN
 AWS_*
 SSH_*
 ```
 
-模型 Provider 的 API Key 保留在 go-tiny-claw 主进程。
+Provider 的 API Key / OAuth token 只由 go-tiny-claw 宿主主进程持有，不传入 Sandbox；全局 Credential Store 不挂载到工作区。Local 模式没有这种宿主文件隔离能力，不能用于不可信任务。
 
 ---
 
@@ -1247,7 +1385,7 @@ Agent.Run
     └── LLM.Action
 ```
 
-以及部分运行属性。
+Root Span 还包含 `provider_id`、`model_id`、`billing_mode`、`auth_type`；不包含 Key、token 或 Authorization header。
 
 用于：
 
@@ -1267,29 +1405,15 @@ CostTracker 会记录：
 - Cached Prompt Tokens（缓存命中）
 - API Latency
 
-输入、输出 Token 总量与人民币估算费用累加到 Session，缓存命中数量显示在单次调用日志中。
+Session 保存 ProviderID、ModelID，以及输入/输出 Token、BillingMode、CostKnown 和货币。CostTracker 与 Benchmark 共用 `ModelInfo` 和 `UsageBilling`，不再按裸模型名套用 GLM 价格。
 
-`internal/observability/tracker.go` 中的价格表按官方价格截图配置，单位为**元/百万 Tokens（CNY）**：
+- **api**：只有 `ModelInfo.Pricing` 存在且注明货币时才估算费用；未知价格显示 `Cost: unknown`。当前内置 OpenAI 模型未设置单价。
+- **subscription**：OpenAI OAuth、ZAI Coding Plan 显示 `计费模式: Subscription` 和 Token 使用量，CostKnown=false，**不显示 ¥0.000000**。API Key 不一定意味着按 token 计费，Coding Plan endpoint 仍属于订阅。
+- **unknown**：自定义 Provider 未声明计费模式时显示 `Cost: unknown`，不能解释为免费。
 
-| 模型 | 输入单价 | 输出单价 | 缓存命中单价 | 缓存存储 |
-| --- | ---: | ---: | ---: | --- |
-| GLM-5.3 | 8 | 28 | 2 | 限时免费 |
-| GLM-5.3-Flash | 0.8 | 2.8 | 0.23 | 限时免费 |
-| GLM-5.3-FlashX | 2 | 7 | 0.57 | 限时免费 |
+已知 API 价格的估算公式：`((输入总量 - 缓存命中) × 输入单价 + 缓存命中 × 缓存单价 + 输出量 × 输出单价) / 1,000,000`。Chat Completions 的 `prompt_tokens_details.cached_tokens` 与 Responses 的 `input_tokens_details.cached_tokens` 都会适配到内部 Usage；缓存命中包含在输入总量中，不能重复计费。
 
-默认 `claw` 使用 `glm-5.3`，费用计算为：
-
-```text
-费用（元）= ((输入总量 - 缓存命中量) × 输入单价
-           + 缓存命中量 × 缓存命中单价
-           + 输出量 × 输出单价) / 1,000,000
-```
-
-OpenAI-compatible Provider 从 `usage.prompt_tokens_details.cached_tokens` 提取缓存命中数量；未返回该字段时按无缓存命中估算。缓存存储当前不计费，限时免费结束后需重新更新配置与计费逻辑。
-
-未配置价格的模型（包括截图未列出的 `glm-5.2`）仍统计 Token，但会输出警告，费用为 0 **不代表免费**，不再使用旧的假定单价。
-
-以上是按量 API 价格估算，不代表 Coding Plan 套餐的实际扣费，也不应作为正式账单依据。
+这些统计不是正式账单或订阅配额验证。Harness Thinking 仍是独立的 Thinking + Action 两次调用，与 ModelInfo.Reasoning 描述的原生能力不同。
 
 ---
 
@@ -1333,11 +1457,13 @@ PASS / FAIL
 - edit_file 修改准确性
 - 阅读 Go 代码并生成单元测试
 
-Benchmark 当前模型单独配置为：
+Benchmark 与 `claw` 共用默认模型配置、凭据解析和计费；也可单次覆盖：
 
-```text
-glm-5.2
+```bash
+go run ./cmd/bench -model zai-coding-cn/glm-5.3
 ```
+
+没有独立 Benchmark Pricing 表，也不会自动切换 Provider。
 
 ---
 
@@ -1353,10 +1479,12 @@ go run ./cmd/claw \
 它只检查本地启动配置，例如：
 
 - mode
-- model
-- workspace
+- Selected Model / Provider / ToolCalling
+- Credential 类型与来源（不输出值）、OAuth 是否需要刷新/受 earliest_refresh_at 限制
+- 选择 OpenAI 时：动态注册支持、Host ID 可用性（不显示 ID）、已有 OAuth 身份与 Plan Usage 状态
+- Global config 路径 / workspace 分离
 - sandbox 参数
-- 必需环境变量
+- 飞书模式的必需环境变量
 
 不会：
 
@@ -1383,8 +1511,8 @@ go run ./cmd/claw \
     默认：workspace
 
 -model
-    智谱模型
-    默认：glm-5.3
+    provider/model
+    默认：全局 config.json → zai-coding-cn/glm-5.3
 
 -prompt
     demo 模式执行的任务
@@ -1421,6 +1549,19 @@ go test ./...
 
 ```bash
 go vet ./...
+```
+
+OAuth/JWKS/模型发现/SSE 测试默认全为 mock，不打开浏览器。显式人工 OAuth 集成测试（使用临时 Agent Home，不覆盖正常凭据）：
+
+```bash
+CLAW_OPENAI_OAUTH_INTEGRATION=1 go test -count=1 -v ./cmd/claw -run '^TestOpenAIOAuthHumanIntegration$'
+# 若也允许一次真实订阅推理（消耗配额），额外设置 CLAW_OPENAI_OAUTH_INFERENCE=1
+```
+
+离线 OAuth → 模型发现 → Responses Tool Calling → Docker → Trace 集成：
+
+```bash
+go test -count=1 -v ./cmd/claw -run '^TestOpenAIOAuthMockDockerAgentIntegration$'
 ```
 
 Docker Executor Integration Test：
@@ -1567,7 +1708,7 @@ Fork
 
 ## Streaming
 
-Executor 已经预留 OutputHandler，但当前完整链路尚未提供真正的实时 Streaming 体验。
+OpenAI OAuth Provider 已消费并聚合 Responses SSE；Executor 已预留 OutputHandler。当前完整链路尚未提供终端/飞书逐 token 的实时 Streaming 体验。
 
 ---
 
