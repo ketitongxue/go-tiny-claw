@@ -7,8 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/approval"
+	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
+	"github.com/ketitongxue/go-tiny-claw/internal/gateway"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 	"github.com/ketitongxue/go-tiny-claw/internal/sessionstore"
@@ -35,22 +38,19 @@ func TestFeishuRestartResumeWithPinnedModelAndContext(t *testing.T) {
 	ctx := context.Background()
 	seen := make(chan []schema.Message, 2)
 	refs := make(chan string, 2)
-	start := func(defaultModel string) *FeishuBot {
+	start := func(defaultModel string) *testRuntime {
 		svc := ctxpkg.NewSessionService(store)
-		b, err := NewFeishuBotWithSessions(dir, func(ctx context.Context, id string) (*ctxpkg.Session, error) {
-			return svc.GetOrCreate(ctx, id, dir, provider.ModelInfo{ProviderID: "fake", ID: defaultModel}, "none")
-		}, func(_ context.Context, s *ctxpkg.Session, _ engine.Reporter) (*engine.AgentEngine, error) {
+		sessions := gateway.DurableSessions{Service: svc, LegacyID: legacyID, Create: func(ctx context.Context, id string) (*ctxpkg.Session, error) {
+			return svc.Create(ctx, id, dir, provider.ModelInfo{ProviderID: "fake", ID: defaultModel}, "none")
+		}}
+		return newTestRuntime(t, dir, sessions.Resolve, func(_ context.Context, s *ctxpkg.Session, _ channel.Route, _ engine.Reporter, _ *approval.Service) (gateway.AgentRunner, error) {
 			refs <- s.ModelRef().String()
 			p := resumeProvider(func(_ context.Context, m []schema.Message, _ []schema.ToolDefinition) (*schema.Message, error) {
 				seen <- m
 				return &schema.Message{Role: schema.RoleAssistant}, nil
 			})
 			return engine.NewAgentEngine(p, tools.NewRegistry(), false, false), nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return b
+		}, approval.NewApprovalManager())
 	}
 	a := start("model-a")
 	if err := a.handleMessage(ctx, textEvent("chat", "1", "first task")); err != nil {

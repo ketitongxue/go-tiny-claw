@@ -14,12 +14,15 @@ import (
 	"syscall"
 
 	"github.com/ketitongxue/go-tiny-claw/internal/app"
+	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/auth"
+	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	"github.com/ketitongxue/go-tiny-claw/internal/config"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
 	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 	"github.com/ketitongxue/go-tiny-claw/internal/feishu"
+	"github.com/ketitongxue/go-tiny-claw/internal/gateway"
 	"github.com/ketitongxue/go-tiny-claw/internal/observability"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider/openai"
@@ -116,22 +119,12 @@ type sessionExecutors struct {
 }
 
 // 每个聊天分别装配引擎、计费器和审批闭包，避免上下文、失败计数与账单串线。
-func newSessionEngine(p provider.LLMProvider, sess *ctxpkg.Session, reporter engine.Reporter, opts options, executors sessionExecutors) *engine.AgentEngine {
+func newSessionEngine(p provider.LLMProvider, sess *ctxpkg.Session, reporter engine.Reporter, opts options, executors sessionExecutors, approvals *approval.Service) *engine.AgentEngine {
 	registry, explorerRegistry := newToolRegistries(sess.WorkDir, executors)
 
-	if opts.mode == "feishu" {
-		middleware := func(ctx context.Context, call schema.ToolCall) (bool, string) {
-			if !feishu.IsDangerousCommand(call.Name, string(call.Arguments)) {
-				return true, ""
-			}
-			r, ok := reporter.(*feishu.FeishuReporter)
-			if !ok || r == nil {
-				return false, "飞书审批通道不可用"
-			}
-			return feishu.GlobalApprovalMgr.WaitForApprovalContext(ctx, r.ChatID(), call.ID, call.Name, string(call.Arguments), r)
-		}
-		registry.Use(middleware)
-		explorerRegistry.Use(middleware)
+	if approvals != nil {
+		registry.Use(approvals.Check)
+		explorerRegistry.Use(approvals.Check)
 	}
 
 	tracked := observability.NewCostTracker(p, opts.modelInfo, sess)
@@ -302,7 +295,7 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	if err != nil {
 		return err
 	}
-	factory := func(callCtx context.Context, sess *ctxpkg.Session, reporter engine.Reporter) (*engine.AgentEngine, error) {
+	factory := func(callCtx context.Context, sess *ctxpkg.Session, _ channel.Route, reporter engine.Reporter, approvals *approval.Service) (gateway.AgentRunner, error) {
 		if err := runtime.Paths.ValidateWorkspace(sess.WorkDir); err != nil {
 			return nil, err
 		}
@@ -312,25 +305,32 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 		}
 		localOpts := opts
 		localOpts.modelInfo = m
-		return newSessionEngine(p, sess, reporter, localOpts, executors), nil
+		return newSessionEngine(p, sess, reporter, localOpts, executors, approvals), nil
 	}
 	if opts.mode == "feishu" {
-		bot, err := feishu.NewFeishuBotWithSessions(opts.workDir, func(callCtx context.Context, id string) (*ctxpkg.Session, error) {
-			sess, err := service.Resume(callCtx, id)
-			if !errors.Is(err, sessionstore.ErrNotFound) {
-				return sess, err
-			}
-			selected, info, err := runtime.Manager.Inspect(callCtx, ref)
-			if err != nil {
-				return nil, err
-			}
-			return service.Create(callCtx, id, opts.workDir, selected, string(info.Type))
-		}, factory)
+		adapter, err := feishu.NewAdapter()
 		if err != nil {
 			return err
 		}
-		log.Printf("启动飞书事件长连接，工作区: %s，模型: %s", opts.workDir, opts.model)
-		return bot.StartLongConnection(ctx)
+		channels := channel.NewRegistry()
+		if err := channels.Register(adapter); err != nil {
+			return err
+		}
+		sessions := gateway.DurableSessions{Service: service, LegacyID: legacyFeishuSessionID,
+			Create: func(callCtx context.Context, id string) (*ctxpkg.Session, error) {
+				selected, info, err := runtime.Manager.Inspect(callCtx, ref)
+				if err != nil {
+					return nil, err
+				}
+				return service.Create(callCtx, id, opts.workDir, selected, string(info.Type))
+			}}
+		gw, err := gateway.New(ctx, gateway.Config{Channels: channels, ResolveSession: sessions.Resolve,
+			Factory: factory, Approvals: approval.NewApprovalManager()})
+		if err != nil {
+			return err
+		}
+		log.Printf("[Gateway] 启动飞书事件长连接，工作区: %s，模型: %s", opts.workDir, opts.model)
+		return gw.Run()
 	}
 
 	reporter := engine.NewTerminalReporter()
@@ -346,7 +346,7 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 		}
 		defer func() { runErr = errors.Join(runErr, sess.Close()) }()
 	}
-	eng, err := factory(ctx, sess, reporter)
+	eng, err := factory(ctx, sess, channel.Route{}, reporter, nil)
 	if err != nil {
 		return err
 	}
@@ -361,6 +361,15 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	usage := sess.UsageSnapshot()
 	log.Printf("会话 %s | Input Tokens: %d | Output Tokens: %d | %s", sess.ID, usage.PromptTokens, usage.CompletionTokens, usage.Billing())
 	return nil
+}
+
+// Legacy ChatID sessions belonged only to the original default bot, never to
+// another channel/account/thread. The gateway itself has no platform special case.
+func legacyFeishuSessionID(route channel.Route) string {
+	if route.Channel == "feishu" && route.AccountID == "default" && route.ThreadID == "" {
+		return route.ChatID
+	}
+	return ""
 }
 
 func checkOpenAIOAuthConfig(ctx context.Context, r *app.Runtime, output io.Writer) error {

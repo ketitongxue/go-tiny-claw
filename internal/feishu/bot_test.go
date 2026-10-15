@@ -13,8 +13,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/approval"
+	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
+	"github.com/ketitongxue/go-tiny-claw/internal/delivery"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
+	"github.com/ketitongxue/go-tiny-claw/internal/gateway"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
@@ -25,18 +29,6 @@ type runnerFunc func(context.Context, *ctxpkg.Session, engine.Reporter) error
 
 func (fn runnerFunc) Run(ctx context.Context, sess *ctxpkg.Session, reporter engine.Reporter) error {
 	return fn(ctx, sess, reporter)
-}
-
-func testBot(t *testing.T, factory func(*ctxpkg.Session, engine.Reporter) agentRunner) *FeishuBot {
-	t.Helper()
-	t.Setenv("FEISHU_APP_ID", "cli_test")
-	t.Setenv("FEISHU_APP_SECRET", "test-secret")
-	b, err := newFeishuBot(t.TempDir(), factory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { b.Close(); b.workers.Wait() })
-	return b
 }
 
 func textEvent(chatID, messageID, text string) *larkim.P2MessageReceiveV1 {
@@ -66,20 +58,25 @@ func receive[T any](t *testing.T, ch <-chan T) T {
 func TestBotConfigurationErrors(t *testing.T) {
 	t.Setenv("FEISHU_APP_ID", "")
 	t.Setenv("FEISHU_APP_SECRET", "secret-must-not-appear")
-	_, err := NewFeishuBotWithFactory(t.TempDir(), func(*ctxpkg.Session, engine.Reporter) *engine.AgentEngine { return nil })
+	_, err := NewAdapter()
 	if err == nil || strings.Contains(err.Error(), "secret-must-not-appear") {
 		t.Fatalf("invalid credential error: %v", err)
 	}
-	legacy := NewFeishuBot(nil, nil)
-	if err := legacy.StartLongConnection(context.Background()); err == nil {
-		t.Fatal("legacy constructor must return startup error, not exit")
+	var unconfigured *Adapter
+	if err := unconfigured.Start(context.Background(), nil); err == nil {
+		t.Fatal("unconfigured adapter must return startup error, not exit")
 	}
 	t.Setenv("FEISHU_APP_ID", "cli_test")
-	if _, err := NewFeishuBotWithFactory(t.TempDir(), nil); err == nil {
-		t.Fatal("nil factory accepted")
+	a, err := NewAdapter()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := newFeishuBot("", func(*ctxpkg.Session, engine.Reporter) agentRunner { return nil }); err == nil {
-		t.Fatal("empty workspace accepted")
+	if err := a.Start(context.Background(), nil); err == nil {
+		t.Fatal("nil handler accepted")
+	}
+	// Runtime factories are now validated by Gateway, not by the adapter.
+	if _, err := gateway.New(context.Background(), gateway.Config{Channels: channel.NewRegistry()}); err == nil {
+		t.Fatal("nil runtime factory accepted")
 	}
 }
 
@@ -154,7 +151,8 @@ func TestConversationsStayOrderedAndIndependent(t *testing.T) {
 		return runnerFunc(func(ctx context.Context, current *ctxpkg.Session, actual engine.Reporter) error {
 			history := current.GetWorkingMemory(0)
 			prompt := history[len(history)-1].Content
-			runs <- run{current.ID, prompt, current.WorkDir, actual.(*FeishuReporter).ChatID(), current, len(history)}
+			route := actual.(*delivery.ChannelReporter).Route()
+			runs <- run{route.ChatID, prompt, current.WorkDir, route.ChatID, current, len(history)}
 			if prompt == "first" {
 				select {
 				case <-release:
@@ -190,47 +188,34 @@ func TestConversationsStayOrderedAndIndependent(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if factories["a"] != 1 || factories["b"] != 1 {
+	if factories[channel.BuildSessionKey(feishuRoute("a"))] != 1 || factories[channel.BuildSessionKey(feishuRoute("b"))] != 1 {
 		t.Fatalf("factory calls = %v", factories)
 	}
 }
 
 func TestApprovalBypassesBusyChatQueue(t *testing.T) {
-	previous := GlobalApprovalMgr
-	GlobalApprovalMgr = NewApprovalManager()
-	t.Cleanup(func() { GlobalApprovalMgr = previous })
+	manager := approval.NewApprovalManager()
+	ready := make(chan struct{}, 1)
 	results := make(chan string, 4)
 	b := testBot(t, func(*ctxpkg.Session, engine.Reporter) agentRunner {
 		return runnerFunc(func(ctx context.Context, sess *ctxpkg.Session, _ engine.Reporter) error {
 			h := sess.GetWorkingMemory(0)
 			if h[len(h)-1].Content == "danger" {
-				allowed, _ := GlobalApprovalMgr.WaitForApprovalContext(ctx, sess.ID, "task-one", "bash", "rm -r target", nil)
+				allowed, _ := manager.Wait(ctx, approval.Request{SessionID: sess.ID, Route: feishuRoute("a"), TaskID: "task-one", ToolName: "bash", Args: "rm -r target"},
+					approvalNotifierFunc(func(context.Context, approval.Request) error { ready <- struct{}{}; return nil }))
 				results <- fmt.Sprintf("approved=%t", allowed)
 			} else {
 				results <- "next"
 			}
 			return nil
 		})
-	})
+	}, manager)
 	b.botOpenID = "bot-self"
 	own := botMention("@_user_1", "bot-self", "Our Bot")
 	if err := b.handleMessage(context.Background(), groupEvent("a", "1", "@_user_1 danger", own)); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.After(3 * time.Second)
-	for {
-		GlobalApprovalMgr.mu.RLock()
-		_, pending := GlobalApprovalMgr.pendingTasks[approvalKey{chatID: "a", taskID: "task-one"}]
-		GlobalApprovalMgr.mu.RUnlock()
-		if pending {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("approval not registered")
-		case <-time.After(time.Millisecond):
-		}
-	}
+	receive(t, ready)
 	if err := b.handleMessage(context.Background(), groupEvent("a", "2", "@_user_1 queued", own)); err != nil {
 		t.Fatal(err)
 	}
@@ -304,9 +289,9 @@ func TestReporterSendsLongUnicodeJSONAndHonorsCancellation(t *testing.T) {
 		handler.ServeHTTP(w, req)
 		return w.Result(), nil
 	})}
-	reporter := &FeishuReporter{chatId: "chat-a", client: lark.NewClient("reporter-app", "secret", lark.WithHttpClient(client), lark.WithEnableTokenCache(false))}
+	adapter := &Adapter{client: lark.NewClient("reporter-app", "secret", lark.WithHttpClient(client), lark.WithEnableTokenCache(false))}
 	text := strings.Repeat("中文😀\n\"quoted\"\\path <>&\u2028\x01", 1500)
-	if err := reporter.sendMsgContext(context.Background(), text); err != nil {
+	if err := adapter.Send(context.Background(), feishuRoute("chat-a"), channel.OutboundMessage{Kind: channel.OutboundText, Text: text}); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -317,7 +302,7 @@ func TestReporterSendsLongUnicodeJSONAndHonorsCancellation(t *testing.T) {
 	mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := reporter.sendMsgContext(ctx, "must not send"); !errors.Is(err, context.Canceled) {
+	if err := adapter.Send(ctx, feishuRoute("chat-a"), channel.OutboundMessage{Kind: channel.OutboundText, Text: "must not send"}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled send returned %v", err)
 	}
 	mu.Lock()
@@ -361,11 +346,11 @@ func TestConnectionCancellationStopsWorkers(t *testing.T) {
 	}
 	receive(t, started)
 	connection := &fakeConnection{started: make(chan struct{}), closed: make(chan struct{})}
-	ctx, cancel := context.WithCancel(context.Background())
+	b.platform.connection = connection
 	done := make(chan error, 1)
-	go func() { done <- b.serveConnection(ctx, connection) }()
+	go func() { done <- b.gateway.Run() }()
 	receive(t, connection.started)
-	cancel()
+	b.Close()
 	receive(t, cancelSeen)
 	select {
 	case err := <-done:
@@ -396,7 +381,7 @@ func (f botRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 func TestFullChatQueueDoesNotBlockOrDeduplicateRejectedMessage(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	processed := make(chan string, chatQueueSize+4)
+	processed := make(chan string, gateway.ConversationQueueSize+4)
 	b := testBot(t, func(*ctxpkg.Session, engine.Reporter) agentRunner {
 		return runnerFunc(func(ctx context.Context, sess *ctxpkg.Session, _ engine.Reporter) error {
 			h := sess.GetWorkingMemory(0)
@@ -417,7 +402,7 @@ func TestFullChatQueueDoesNotBlockOrDeduplicateRejectedMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	receive(t, started)
-	for i := 0; i < chatQueueSize; i++ {
+	for i := 0; i < gateway.ConversationQueueSize; i++ {
 		id := fmt.Sprintf("queued-%d", i)
 		if err := b.handleMessage(context.Background(), textEvent("a", id, id)); err != nil {
 			t.Fatal(err)
@@ -430,7 +415,7 @@ func TestFullChatQueueDoesNotBlockOrDeduplicateRejectedMessage(t *testing.T) {
 		t.Fatal("overflow should be rejected for later retry")
 	}
 	close(release)
-	for i := 0; i <= chatQueueSize; i++ {
+	for i := 0; i <= gateway.ConversationQueueSize; i++ {
 		receive(t, processed)
 	}
 	if err := b.handleMessage(context.Background(), overflow); err != nil {
@@ -452,8 +437,8 @@ func TestReporterPropagatesAPIErrorWithoutResponseBody(t *testing.T) {
 		}
 		return w.Result(), nil
 	})}
-	reporter := &FeishuReporter{chatId: "a", client: lark.NewClient("failing-app", "secret", lark.WithHttpClient(client), lark.WithEnableTokenCache(false))}
-	err := reporter.sendMsgContext(context.Background(), "approval notice")
+	adapter := &Adapter{client: lark.NewClient("failing-app", "secret", lark.WithHttpClient(client), lark.WithEnableTokenCache(false))}
+	err := adapter.Send(context.Background(), feishuRoute("a"), channel.OutboundMessage{Kind: channel.OutboundText, Text: "approval notice"})
 	if err == nil || !strings.Contains(err.Error(), "99991672") || strings.Contains(err.Error(), "raw-payload") {
 		t.Fatalf("unexpected send error: %v", err)
 	}
@@ -514,9 +499,7 @@ func TestGroupRequiresOwnBotMentionAndPreservesOthers(t *testing.T) {
 		if err := b.handleMessage(context.Background(), event); err != nil {
 			t.Fatal(err)
 		}
-		b.mu.Lock()
-		defer b.mu.Unlock()
-		if len(b.chats) != 0 {
+		if b.gateway.ConversationCount() != 0 {
 			t.Fatal("group event created a conversation without verified own-bot mention")
 		}
 	}
@@ -580,9 +563,7 @@ func TestBotIdentityFailureKeepsGroupsClosedAndP2PAvailable(t *testing.T) {
 			if got := receive(t, prompts); got != "direct" {
 				t.Fatalf("unverified group executed: %q", got)
 			}
-			b.mu.Lock()
-			defer b.mu.Unlock()
-			if _, exists := b.chats["group"]; exists {
+			if b.gateway.ConversationCount() != 1 {
 				t.Fatal("unverified group conversation was created")
 			}
 		})

@@ -46,6 +46,7 @@
 | Subagent                            | ✅ 默认启用      |
 | 多会话                                 | ✅           |
 | 飞书长连接                               | ✅ 默认入口      |
+| Messaging Gateway Core              | ✅ Adapter / Conversation Runtime 解耦 |
 | 同会话顺序执行                             | ✅           |
 | 不同飞书会话并行                            | ✅           |
 | Human Approval                      | ✅           |
@@ -85,7 +86,7 @@
                      │
              ┌───────┴───────┐
              │               │
-          Feishu           Demo CLI
+       Feishu Gateway      Demo CLI
              │               │
              └───────┬───────┘
                      ▼
@@ -126,6 +127,17 @@ Tool Registry → PromptComposer ← Runtime / Plan
                               │             │
                            Docker         Local
 ```
+
+M5.3 消息链路独立于平台 SDK：
+
+```text
+Feishu SDK → Feishu Adapter → InboundMessage → Gateway
+                                               ├→ Command Router → Approval
+                                               └→ Conversation Manager → Queue → Durable Session → AgentEngine
+AgentEngine → ChannelReporter → DeliveryService → ChannelRegistry → Feishu Adapter
+```
+
+每个 Route（channel/account/chat/thread）对应独立 Session；同 Conversation 串行，不同 Conversation 并行。审批命令绕过普通队列，群聊普通消息仍要求明确 @ 自己的 bot，群聊 approve/reject 回复无需 mention。Adapter 只做连接、平台事件转换和发送，不创建 Session/Engine。Demo 继续使用 TerminalReporter。本轮只接入单账号飞书，不做跨平台身份合并或多平台启动。
 
 项目将 Agent 推理、工具定义和实际命令执行解耦。
 
@@ -180,9 +192,12 @@ go-tiny-claw/
 │   │   ├── policy.go
 │   │   └── config.go
 │   │
+│   ├── channel/                  # Adapter / Route / Message / Registry
+│   ├── gateway/                  # Conversation / Queue / Dedup / Session Resolve
+│   ├── delivery/                 # DeliveryService / ChannelReporter
+│   ├── approval/                 # Session-scoped Approval / Dangerous Policy
 │   ├── feishu/
-│   │   ├── bot.go
-│   │   └── approval.go
+│   │   └── adapter.go            # Long Connection / Mention / API / Chunking
 │   │
 │   ├── eval/
 │   │   └── benchmark.go
@@ -1205,9 +1220,9 @@ claw -mode demo -resume <session-id> -prompt "继续刚才的任务"
 claw session delete <session-id> # 只删 Session，不删代码、WorkDir 或 Trace
 ```
 
-新 Demo 使用随机 ID；飞书按 ChatID 自动恢复。Resume 使用保存的 provider/model，不随默认模型改变。WorkDir 不存在会报错；凭据由现有 AuthManager 重新解析/刷新，Session 不保存任何认证 Token。
+新 Demo 使用随机 ID；飞书一个 Chat 对应一个 Durable Session，重启自动恢复。新 Session ID 由 Core 编码为 `channel:feishu:account:default:chat:<escaped-chat-id>`，各字段使用 QueryEscape，非空 Thread 可追加 `:thread:<escaped-thread-id>`（当前飞书 Thread 仍为空）。查找顺序是新 Key → 旧 ChatID；旧 Session 保留原 ID，不重写 JSONL。只有 NotFound 才允许 fallback/create，锁冲突或损坏不会静默另建 Session。Resume 使用保存的 provider/model，不随默认模型改变。WorkDir 不存在会报错；凭据由现有 AuthManager 重新解析/刷新，Session 不保存任何认证 Token。
 
-**M5.1 Durable Runtime Hardening**：Session Store 使用 **single-writer process ownership**。macOS / Linux 上以 `<SHA256(SessionID)>.lock` 的 OS `flock` 持有写权限；Demo 持有到运行返回，飞书 chat worker 持有到退出。另一进程对活动 Session 的 Resume / Append / Usage / Delete 会明确报错 `session is currently in use by another claw process`，只读 `sessions` / `session show` 可并发使用。进程崩溃后 OS 自动释放锁，不需要删除残留 `.lock` 文件，也不要手工删除它。此锁不覆盖 AuthStore / OAuth refresh，也不是安全边界。
+**M5.1 Durable Runtime Hardening**：Session Store 使用 **single-writer process ownership**。macOS / Linux 上以 `<SHA256(SessionID)>.lock` 的 OS `flock` 持有写权限；Demo 持有到运行返回，Gateway Conversation worker 持有到退出；Shutdown 取消运行与审批、丢弃未执行队列，等待 worker 完成后 Close Session 释放锁。另一进程对活动 Session 的 Resume / Append / Usage / Delete 会明确报错 `session is currently in use by another claw process`，只读 `sessions` / `session show` 可并发使用。进程崩溃后 OS 自动释放锁，不需要删除残留 `.lock` 文件，也不要手工删除它。此锁不覆盖 AuthStore / OAuth refresh，也不是安全边界。
 
 持有 writer ownership 时，Create 直接初始化 Snapshot / Offset 缓存，首次 Resume 只重放一次；后续 Append 只验证和编码新事件，不重新读取历史 JSONL。检测到文件 size / identity / mtime 变化会重新验证；尾部 torn event 可恢复，中间损坏仍报错。写入、Sync、Close 成功后才发布缓存。Persistence 继承任务 Context；取消阻止尚未开始的写入，已经开始的提交先完成或恢复一致状态。每轮 Turn Span 独立结束一次，不在长 Run 中累积 defer。JSONL schema 保持 v1，ContextBuilder / Model Pinning 行为不变。
 
@@ -1468,6 +1483,8 @@ Agent.Run
     └── LLM.Action
 ```
 
+Messaging Run 的 Root Span 另外包含 `channel`、`account_id`、`chat_type`；Session ID 在 Trace/文件名/Engine 日志中使用 SHA256 reference，不额外记录原始 ChatID/UserID。正文或工具输出仍可能包含敏感信息，此处并非通用脱敏机制。
+
 Root Span 还包含 `provider_id`、`model_id`、`billing_mode`、`auth_type`，以及 `prompt.section_count`、`prompt.sections`、`prompt.core_hash`、`prompt.project_context_hash`、`prompt.skills_hash`、`prompt.estimated_tokens`、`prompt.skills_count`、`prompt.context_files_count`；不记录完整 System Prompt，也不包含 Key、token 或 Authorization header。按需读取资源仍属于普通 Tool Output，现有 Session 与 Tool Trace preview 可能含敏感内容，需独立保护。
 
 用于：
@@ -1637,7 +1654,7 @@ go test -bench=FileStore -benchmem ./internal/sessionstore
 go test -bench=Prompt -benchmem ./internal/context/...
 ```
 
-Prompt Main/Explorer Golden 使用固定虚拟路径，位于 `internal/context/testdata/`。修改规则后审查 diff，再显式运行 `go test ./internal/context -run TestPromptGolden -update-prompt-golden` 更新；不要盲目刷新。M5.2 架构、测试及人工验收见 [M5.2 Report](docs/M5.2-report.md)。
+Prompt Main/Explorer Golden 使用固定虚拟路径，位于 `internal/context/testdata/`。修改规则后审查 diff，再显式运行 `go test ./internal/context -run TestPromptGolden -update-prompt-golden` 更新；不要盲目刷新。M5.2 架构、测试及人工验收见 [M5.2 Report](docs/M5.2-report.md)。M5.3 Gateway/飞书迁移、Legacy 兼容及人工验收见 [M5.3 Report](docs/M5.3-report.md)。
 
 FileStore Benchmark 比较 100 / 1000 条历史消息的单次 Append（包含 fsync）；不设绝对耗时 SLA。确定性测试另外验证 fast path 不读取完整历史，并覆盖跨进程冲突、活动 Session 只读访问及 SIGKILL 后锁释放。M5.1 变更与人工验收见 [M5.1 Report](docs/M5.1-report.md)。
 
@@ -1848,7 +1865,7 @@ Task Deadline
 建议后续演进方向：
 
 ```text
-1. Session Persistence / Hardening、Prompt Architecture（M5 / M5.1 / M5.2 已实现，M5.2 等待人工验收）
+1. Session Persistence / Hardening、Prompt Architecture、Messaging Gateway（M5 / M5.1 / M5.2 / M5.3 已实现，M5.2 / M5.3 等待人工验收）
 2. Git Checkpoint / Diff / Rollback（不自动开始 M6）
 3. Task Verifier
 4. Streaming / Cancel / Steering

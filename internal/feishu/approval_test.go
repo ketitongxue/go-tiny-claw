@@ -2,218 +2,162 @@ package feishu
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
-	"time"
+
+	"github.com/ketitongxue/go-tiny-claw/internal/approval"
+	"github.com/ketitongxue/go-tiny-claw/internal/channel"
+	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
+	"github.com/ketitongxue/go-tiny-claw/internal/engine"
+	"github.com/ketitongxue/go-tiny-claw/internal/gateway"
+	"github.com/ketitongxue/go-tiny-claw/internal/provider"
+	"github.com/ketitongxue/go-tiny-claw/internal/schema"
+	"github.com/ketitongxue/go-tiny-claw/internal/sessionstore"
+	"github.com/ketitongxue/go-tiny-claw/internal/tools"
+	lark "github.com/larksuite/oapi-sdk-go/v3"
 )
 
-func startApprovalWait(ctx context.Context, manager *ApprovalManager, chatID, taskID string) <-chan ApprovalResult {
-	result := make(chan ApprovalResult, 1)
-	go func() {
-		allowed, reason := manager.WaitForApprovalContext(ctx, chatID, taskID, "test_tool", "test args", nil)
-		result <- ApprovalResult{Allowed: allowed, Reason: reason}
-	}()
-	return result
-}
-
-func waitForPendingApproval(t *testing.T, manager *ApprovalManager, chatID, taskID string) *pendingApproval {
+func recordingClient(t *testing.T, sent chan<- string) *lark.Client {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		manager.mu.RLock()
-		pending := manager.pendingTasks[approvalKey{chatID: chatID, taskID: taskID}]
-		manager.mu.RUnlock()
-		if pending != nil {
-			return pending
+	client := &http.Client{Transport: botRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(req.URL.Path, "tenant_access_token") {
+			fmt.Fprint(w, `{"code":0,"tenant_access_token":"test-token","expire":7200}`)
+		} else {
+			var body struct {
+				ReceiveID string `json:"receive_id"`
+				Content   string `json:"content"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			if body.ReceiveID != "chat" {
+				t.Errorf("wrong approval/progress destination: %q", body.ReceiveID)
+			}
+			var content struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal([]byte(body.Content), &content); err != nil {
+				t.Error(err)
+			}
+			sent <- content.Text
+			fmt.Fprint(w, `{"code":0,"data":{"message_id":"out"}}`)
 		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("approval %q in chat %q was not registered", taskID, chatID)
-	return nil
+		return w.Result(), nil
+	})}
+	return lark.NewClient("regression-"+t.Name(), "secret", lark.WithHttpClient(client), lark.WithEnableTokenCache(false))
 }
 
-func receiveApproval(t *testing.T, result <-chan ApprovalResult) ApprovalResult {
-	t.Helper()
-	select {
-	case approval := <-result:
-		return approval
-	case <-time.After(2 * time.Second):
-		t.Fatal("approval wait did not finish")
-		return ApprovalResult{}
-	}
+type approvedTestTool struct{ executed chan<- struct{} }
+
+func (approvedTestTool) Name() string { return "bash" }
+func (approvedTestTool) Definition() schema.ToolDefinition {
+	return schema.ToolDefinition{Name: "bash"}
+}
+func (tool approvedTestTool) Execute(context.Context, json.RawMessage) (string, error) {
+	tool.executed <- struct{}{}
+	return "executed", nil
 }
 
-func assertNoPendingApprovals(t *testing.T, manager *ApprovalManager) {
-	t.Helper()
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	if len(manager.pendingTasks) != 0 {
-		t.Fatalf("pending approvals were not cleaned up: %d", len(manager.pendingTasks))
-	}
-}
-
-func TestApprovalIsolatedByChat(t *testing.T) {
-	t.Parallel()
-	manager := NewApprovalManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	first := startApprovalWait(ctx, manager, "chat-one", "same-task")
-	second := startApprovalWait(ctx, manager, "chat-two", "same-task")
-	waitForPendingApproval(t, manager, "chat-one", "same-task")
-	waitForPendingApproval(t, manager, "chat-two", "same-task")
-
-	if manager.ResolveApprovalForChat("unrelated-chat", "same-task", true, "wrong chat") {
-		t.Fatal("unrelated chat resolved an approval")
-	}
-	manager.ResolveApproval("same-task", true, "legacy resolver cannot resolve chat-scoped requests")
-	if !manager.ResolveApprovalForChat("chat-one", "same-task", true, "approved in first chat") {
-		t.Fatal("first chat approval was not resolved")
-	}
-	if result := receiveApproval(t, first); !result.Allowed || result.Reason != "approved in first chat" {
-		t.Fatalf("unexpected first chat result: %+v", result)
-	}
-	select {
-	case result := <-second:
-		t.Fatalf("first chat resolved the second chat request: %+v", result)
-	default:
-	}
-	if !manager.ResolveApprovalForChat("chat-two", "same-task", false, "rejected in second chat") {
-		t.Fatal("second chat rejection was not resolved")
-	}
-	if result := receiveApproval(t, second); result.Allowed || result.Reason != "rejected in second chat" {
-		t.Fatalf("unexpected second chat result: %+v", result)
-	}
-	assertNoPendingApprovals(t, manager)
-}
-
-func TestDuplicateApprovalResolutionsDoNotBlock(t *testing.T) {
-	t.Parallel()
-	manager := NewApprovalManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	result := startApprovalWait(ctx, manager, "chat", "task")
-	waitForPendingApproval(t, manager, "chat", "task")
-
-	const resolvers = 32
-	resolved := make(chan bool, resolvers)
-	var group sync.WaitGroup
-	for range resolvers {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			resolved <- manager.ResolveApprovalForChat("chat", "task", true, "approved")
-		}()
-	}
-	done := make(chan struct{})
-	go func() {
-		group.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("duplicate approval resolution blocked")
-	}
-	close(resolved)
-	successes := 0
-	for success := range resolved {
-		if success {
-			successes++
-		}
-	}
-	if successes != 1 {
-		t.Fatalf("resolved %d times, want exactly one", successes)
-	}
-	if approval := receiveApproval(t, result); !approval.Allowed {
-		t.Fatalf("approval unexpectedly rejected: %+v", approval)
-	}
-	assertNoPendingApprovals(t, manager)
-}
-
-func TestDuplicateApprovalWaitPreservesOriginal(t *testing.T) {
-	t.Parallel()
-	manager := NewApprovalManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	original := startApprovalWait(ctx, manager, "chat", "task")
-	waitForPendingApproval(t, manager, "chat", "task")
-	if allowed, reason := manager.WaitForApprovalContext(ctx, "chat", "task", "test_tool", "test args", nil); allowed || reason == "" {
-		t.Fatalf("duplicate wait was not denied: allowed=%v reason=%q", allowed, reason)
-	}
-	if !manager.ResolveApprovalForChat("chat", "task", true, "original request") {
-		t.Fatal("duplicate wait replaced the original request")
-	}
-	if result := receiveApproval(t, original); !result.Allowed || result.Reason != "original request" {
-		t.Fatalf("unexpected original result: %+v", result)
-	}
-	assertNoPendingApprovals(t, manager)
-}
-
-func TestApprovalCancellationAndTimeoutCleanUp(t *testing.T) {
-	t.Parallel()
-	for _, name := range []string{"canceled", "timeout", "already canceled"} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			manager := NewApprovalManager()
-			ctx, cancel := context.WithCancel(context.Background())
-			if name == "timeout" {
-				cancel()
-				ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+func TestFeishuApprovalAndRejectThroughGatewayEngineAndDelivery(t *testing.T) {
+	for _, command := range []string{"approve", "reject"} {
+		t.Run(command, func(t *testing.T) {
+			t.Setenv("FEISHU_APP_ID", "cli_test")
+			t.Setenv("FEISHU_APP_SECRET", "test")
+			dir := t.TempDir()
+			svc := ctxpkg.NewSessionService(sessionstore.NewMemoryStore())
+			sessions := gateway.DurableSessions{Service: svc, Create: func(ctx context.Context, id string) (*ctxpkg.Session, error) {
+				return svc.Create(ctx, id, dir, provider.ModelInfo{}, "")
+			}}
+			sent := make(chan string, 10)
+			executed := make(chan struct{}, 1)
+			done := make(chan error, 1)
+			b := newTestRuntime(t, dir, sessions.Resolve, func(_ context.Context, _ *ctxpkg.Session, _ channel.Route, _ engine.Reporter, approvals *approval.Service) (gateway.AgentRunner, error) {
+				registry := tools.NewRegistry()
+				registry.Register(approvedTestTool{executed})
+				registry.Use(approvals.Check)
+				turn := 0
+				p := resumeProvider(func(_ context.Context, msgs []schema.Message, _ []schema.ToolDefinition) (*schema.Message, error) {
+					turn++
+					if turn == 1 {
+						return &schema.Message{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: "task123", Name: "bash", Arguments: []byte(`{"command":"rm -r target"}`)}}}, nil
+					}
+					last := msgs[len(msgs)-1]
+					if command == "approve" && last.Content != "executed" {
+						return nil, fmt.Errorf("approved tool not executed: %+v", last)
+					}
+					if command == "reject" && !strings.Contains(last.Content, "人类管理员已拒绝操作") {
+						return nil, fmt.Errorf("missing rejection: %+v", last)
+					}
+					return &schema.Message{Role: schema.RoleAssistant, Content: "done"}, nil
+				})
+				eng := engine.NewAgentEngine(p, registry, false, false)
+				return runnerFunc(func(ctx context.Context, s *ctxpkg.Session, r engine.Reporter) error {
+					err := eng.Run(ctx, s, r)
+					done <- err
+					return err
+				}), nil
+			}, approval.NewApprovalManager())
+			b.client = recordingClient(t, sent)
+			if err := b.handleMessage(context.Background(), textEvent("chat", "1", "danger")); err != nil {
+				t.Fatal(err)
 			}
-			t.Cleanup(cancel)
-			if name == "already canceled" {
-				cancel()
+			for {
+				text := receive(t, sent)
+				if strings.Contains(text, "高危操作审批请求") {
+					if !strings.Contains(text, "approve task123") || !strings.Contains(text, "reject task123") {
+						t.Fatal("notice rendering changed", text)
+					}
+					break
+				}
 			}
-			result := startApprovalWait(ctx, manager, "chat", "task")
-			if name != "already canceled" {
-				waitForPendingApproval(t, manager, "chat", "task")
+			// Plain group replies must bypass the busy worker and need no bot identity.
+			if err := b.handleMessage(context.Background(), groupEvent("chat", "2", command+" task123")); err != nil {
+				t.Fatal(err)
 			}
-			if name == "canceled" {
-				cancel()
+			if err := receive(t, done); err != nil {
+				t.Fatal(err)
 			}
-			approval := receiveApproval(t, result)
-			if approval.Allowed || !strings.Contains(approval.Reason, ctx.Err().Error()) {
-				t.Fatalf("canceled approval was not rejected with context reason: %+v", approval)
-			}
-			assertNoPendingApprovals(t, manager)
-			if manager.ResolveApprovalForChat("chat", "task", true, "too late") {
-				t.Fatal("approval resolved after cancellation")
+			if command == "approve" {
+				receive(t, executed)
+			} else {
+				select {
+				case <-executed:
+					t.Fatal("rejected tool executed")
+				default:
+				}
 			}
 		})
 	}
 }
 
-func TestApprovalHasFiniteDefaultDeadline(t *testing.T) {
-	t.Parallel()
-	manager := NewApprovalManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	result := startApprovalWait(ctx, manager, "chat", "task")
-	pending := waitForPendingApproval(t, manager, "chat", "task")
-	deadline, ok := pending.ctx.Deadline()
-	remaining := time.Until(deadline)
-	if !ok || remaining <= 0 || remaining > defaultApprovalTimeout {
-		t.Fatalf("unexpected default deadline: present=%v remaining=%v", ok, remaining)
+func TestFeishuChannelReporterProgressRegression(t *testing.T) {
+	sent := make(chan string, 8)
+	done := make(chan struct{}, 1)
+	b := testBot(t, func(*ctxpkg.Session, engine.Reporter) agentRunner {
+		return runnerFunc(func(ctx context.Context, _ *ctxpkg.Session, r engine.Reporter) error {
+			r.OnThinking(ctx)
+			r.OnToolCall(ctx, "bash", "echo hi")
+			r.OnToolResult(ctx, "bash", "hidden success output", false)
+			r.OnToolResult(ctx, "bash", "failure", true)
+			r.OnMessage(ctx, "final")
+			done <- struct{}{}
+			return nil
+		})
+	})
+	b.client = recordingClient(t, sent)
+	if err := b.handleMessage(context.Background(), textEvent("chat", "1", "run")); err != nil {
+		t.Fatal(err)
 	}
-	cancel()
-	if approval := receiveApproval(t, result); approval.Allowed {
-		t.Fatal("canceled default wait was allowed")
-	}
-	assertNoPendingApprovals(t, manager)
-}
-
-func TestApprovalSendFailureCleansUp(t *testing.T) {
-	t.Parallel()
-	manager := NewApprovalManager()
-	// An unconfigured reporter fails locally without making any network request.
-	reporter := &FeishuReporter{chatId: "chat"}
-	allowed, reason := manager.WaitForApprovalContext(context.Background(), "chat", "task", "test_tool", "test args", reporter)
-	if allowed || !strings.Contains(reason, "发送审批请求失败") {
-		t.Fatalf("send failure did not reject approval: allowed=%v reason=%q", allowed, reason)
-	}
-	assertNoPendingApprovals(t, manager)
-	if manager.ResolveApprovalForChat("chat", "task", true, "too late") {
-		t.Fatal("failed notification left a resolvable approval")
+	receive(t, done)
+	for _, want := range []string{"🤔 模型正在慢思考 (Thinking)...", "🛠️ **正在执行工具**：`bash`\n参数：`echo hi`", "✅ **执行成功** (bash)", "⚠️ **执行报错** (bash)：\nfailure", "final"} {
+		if got := receive(t, sent); got != want {
+			t.Fatalf("progress rendering changed: %q, want %q", got, want)
+		}
 	}
 }

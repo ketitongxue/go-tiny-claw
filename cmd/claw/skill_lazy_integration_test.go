@@ -54,7 +54,7 @@ func TestSkillLazyLoadingUsesExistingReadToolAndRelativeReference(t *testing.T) 
 	if err := session.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "帮我补 Go 单元测试"}); err != nil {
 		t.Fatal(err)
 	}
-	eng := newSessionEngine(p, session, nil, options{mode: "demo", promptHome: home}, sessionExecutors{})
+	eng := newSessionEngine(p, session, nil, options{mode: "demo", promptHome: home}, sessionExecutors{}, nil)
 	if err := eng.Run(context.Background(), session, nil); err != nil {
 		t.Fatal(err)
 	}

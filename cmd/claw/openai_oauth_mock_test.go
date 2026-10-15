@@ -205,7 +205,7 @@ func TestOpenAIOAuthMockDockerAgentIntegration(t *testing.T) {
 	}
 	sess := ctxpkg.NewSession("oauth-docker", workspace)
 	reporter := engine.NewTerminalReporter()
-	eng := newSessionEngine(p, sess, reporter, opts, executors)
+	eng := newSessionEngine(p, sess, reporter, opts, executors, nil)
 	sess.Append(ctx, schema.Message{Role: schema.RoleUser, Content: "读取当前工作区文件，并总结目录结构"})
 	if err := eng.Run(ctx, sess, reporter); err != nil {
 		t.Fatal(err)

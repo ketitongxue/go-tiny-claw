@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/approval"
+	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
@@ -268,7 +270,7 @@ func runSessionFactoryRegression(t *testing.T, opts options, executors sessionEx
 		phase++
 		return resp, nil
 	})
-	eng := newSessionEngine(p, sess, nil, opts, executors)
+	eng := newSessionEngine(p, sess, nil, opts, executors, nil)
 	sess.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "run regression"})
 	if err := eng.Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
@@ -369,7 +371,7 @@ esac`)
 	})
 	sess := ctxpkg.NewSession("explorer-policy", workDir)
 	sess.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "test Explorer isolation"})
-	if err := newSessionEngine(p, sess, nil, opts, executors).Run(context.Background(), sess, nil); err != nil {
+	if err := newSessionEngine(p, sess, nil, opts, executors, nil).Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
 	}
 	log, err := os.ReadFile(logFile)
@@ -428,7 +430,7 @@ func TestLocalExplorerDoesNotExposeUnsafeBash(t *testing.T) {
 		}
 		return &schema.Message{Role: schema.RoleAssistant, Content: "done"}, nil
 	})
-	eng := newSessionEngine(engProvider, sess, nil, opts, executors)
+	eng := newSessionEngine(engProvider, sess, nil, opts, executors, nil)
 	sess.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "read-only local exploration"})
 	if err := eng.Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
@@ -439,7 +441,7 @@ func TestLocalExplorerDoesNotExposeUnsafeBash(t *testing.T) {
 	}
 }
 
-func TestFeishuFactoryDeniesDangerousToolWithoutApprovalChannel(t *testing.T) {
+func TestFactoryDeniesDangerousToolWithoutApprovalNotifier(t *testing.T) {
 	sess := ctxpkg.NewSession("chat", t.TempDir())
 	phase := 0
 	p := providerFunc(func(_ context.Context, msgs []schema.Message, _ []schema.ToolDefinition) (*schema.Message, error) {
@@ -448,13 +450,16 @@ func TestFeishuFactoryDeniesDangerousToolWithoutApprovalChannel(t *testing.T) {
 			return &schema.Message{Role: schema.RoleAssistant, ToolCalls: []schema.ToolCall{{ID: "danger", Name: "bash", Arguments: json.RawMessage(`{"command":"sudo --version"}`)}}}, nil
 		}
 		last := msgs[len(msgs)-1]
-		if last.ToolCallID != "danger" || !strings.Contains(last.Content, "飞书审批通道不可用") {
+		if last.ToolCallID != "danger" || !strings.Contains(last.Content, "审批通道不可用") {
 			return nil, fmt.Errorf("dangerous command was not denied: %+v", last)
 		}
 		return &schema.Message{Role: schema.RoleAssistant, Content: "denied"}, nil
 	})
 	sess.Append(context.Background(), schema.Message{Role: schema.RoleUser, Content: "approval test"})
-	if err := newSessionEngine(p, sess, nil, options{mode: "feishu", model: "glm-5.2"}, sessionExecutors{coding: executor.NewLocalExecutor()}).Run(context.Background(), sess, nil); err != nil {
+	// Explicit runtime injection enables approval even in demo mode and without
+	// a concrete channel reporter. No mode-dependent tool policy remains.
+	approvals := approval.NewService(approval.NewApprovalManager(), sess.ID, channel.Route{Channel: "test", AccountID: "default", ChatID: "chat"}, nil)
+	if err := newSessionEngine(p, sess, nil, options{mode: "demo", model: "glm-5.2"}, sessionExecutors{coding: executor.NewLocalExecutor()}, approvals).Run(context.Background(), sess, nil); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -43,11 +43,21 @@ func NewAgentEngine(p provider.LLMProvider, r tools.Registry, enableThinking boo
 
 // 【核心改造】: 移除 userPrompt 参数，改为接收一个具体的 Session 实例
 func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter Reporter) error {
-	log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s\n", session.ID, session.WorkDir)
+	traceID := session.ID
+	messaging, isMessaging := observability.MessagingFromContext(ctx)
+	if isMessaging {
+		traceID = observability.SessionReference(session.ID)
+	}
+	log.Printf("[Engine] 唤醒会话 [%s]，锁定工作区: %s\n", traceID, session.WorkDir)
 
 	// 【埋点 1】：开启 Root Span，记录整个任务的生命周期
 	ctx, rootSpan := observability.StartSpan(ctx, "Agent.Run")
-	rootSpan.AddAttribute("SessionID", session.ID)
+	rootSpan.AddAttribute("SessionID", traceID)
+	if isMessaging {
+		rootSpan.AddAttribute("channel", messaging.Channel)
+		rootSpan.AddAttribute("account_id", messaging.AccountID)
+		rootSpan.AddAttribute("chat_type", messaging.ChatType)
+	}
 	rootSpan.AddAttribute("WorkDir", session.WorkDir)
 	for key, value := range session.ModelAttributes() {
 		rootSpan.AddAttribute(key, value)
@@ -56,7 +66,7 @@ func (e *AgentEngine) Run(ctx context.Context, session *ctxpkg.Session, reporter
 	// defer 保证在引擎退出时，无论成功失败，都能结束根 Span 并导出 Trace 报告
 	defer func() {
 		rootSpan.EndSpan()
-		if err := observability.ExportTraceToFile(rootSpan, session.WorkDir, session.ID); err != nil {
+		if err := observability.ExportTraceToFile(rootSpan, session.WorkDir, traceID); err != nil {
 			log.Printf("[Tracing] 保存执行链路失败: %v", err)
 		} else {
 			log.Printf("📊 [Tracing] 本次任务的执行回放链路已保存至工作区的 .claw/traces 目录下\n")
