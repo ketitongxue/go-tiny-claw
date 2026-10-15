@@ -35,6 +35,7 @@ type Gateway struct {
 	dedup         deduplicator
 	started       bool
 	adapters      sync.WaitGroup
+	retry         adapterRetryPolicy
 }
 
 func New(ctx context.Context, cfg Config) (*Gateway, error) {
@@ -46,7 +47,7 @@ func New(ctx context.Context, cfg Config) (*Gateway, error) {
 		delivery: delivery.NewService(cfg.Channels), approvals: cfg.Approvals,
 		reportingPolicy: cfg.ReportingPolicy, conversations: make(map[string]*Conversation)}
 	return &Gateway{ctx: ctx, cancel: cancel, channels: cfg.Channels, conversations: m,
-		commands: commandRouter{approvals: cfg.Approvals, conversations: m}}, nil
+		retry: defaultAdapterRetryPolicy(), commands: commandRouter{approvals: cfg.Approvals, conversations: m}}, nil
 }
 
 // Receive acknowledges acceptance, not completion. Event callback cancellation
@@ -146,8 +147,8 @@ func (g *Gateway) Shutdown() error {
 	return g.conversations.wait()
 }
 
-// Run serves registered adapters, then cancels and drains the whole runtime on
-// cancellation or any adapter exit. Adapter.Start is responsible for SDK stop.
+// Run supervises each adapter independently. Only cancellation or permanent
+// failure of every adapter stops/drains the runtime. Start owns platform cleanup.
 func (g *Gateway) Run() (runErr error) {
 	g.mu.Lock()
 	if g.started {
@@ -169,15 +170,22 @@ func (g *Gateway) Run() (runErr error) {
 	for _, adapter := range adapters {
 		go func(a channel.Adapter) {
 			defer g.adapters.Done()
-			results <- a.Start(g.ctx, g.Receive)
+			results <- g.supervise(a)
 		}(adapter)
 	}
 	g.mu.Unlock()
 	defer func() { runErr = errors.Join(runErr, g.Shutdown()) }()
-	select {
-	case <-g.ctx.Done():
-		return g.ctx.Err()
-	case err := <-results:
-		return err
+	var failures []error
+	for remaining := len(adapters); remaining > 0; remaining-- {
+		select {
+		case <-g.ctx.Done():
+			return g.ctx.Err()
+		case err := <-results:
+			if g.ctx.Err() != nil {
+				return g.ctx.Err()
+			}
+			failures = append(failures, err)
+		}
 	}
+	return errors.Join(failures...)
 }

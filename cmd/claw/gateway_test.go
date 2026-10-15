@@ -13,6 +13,7 @@ func TestLegacyFeishuMappingRestrictedToOriginalConversation(t *testing.T) {
 	}
 	for _, r := range []channel.Route{
 		{Channel: "other", AccountID: "default", ChatID: "oc_old"},
+		{Channel: "telegram", AccountID: "default", ChatID: "oc_old"},
 		{Channel: "feishu", AccountID: "another", ChatID: "oc_old"},
 		{Channel: "feishu", AccountID: "default", ChatID: "oc_old", ThreadID: "thread"},
 	} {

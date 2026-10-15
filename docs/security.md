@@ -9,9 +9,11 @@
 - API Key 可来自 AuthStore 或明确配置的环境变量，AuthStore 优先。logout 只清除 Store，环境变量仍可能提供凭据。自定义配置仅接受 none 或 api_key + env，禁止明文 literal key、shell/command credentials、自定义 OAuth 和覆盖内置 Provider。
 - OAuth 使用独立的 Authorization Code + PKCE(S256)、随机 state/nonce 和 `127.0.0.1` loopback callback。一次 attempt 的 authorization/token exchange 使用完全相同的 redirect URI。手动模式必须粘贴完整 callback URL；禁止裸 code 绕过 state/issued-client 校验。token exchange/refresh 不自动重试单次 grant、不跟随重定向、不打印 server body 或凭据。取消会关闭 callback listener。
 - OpenAI 默认使用 Dynamic OSS Client Registration；`OPENAI_OAUTH_CLIENT_ID` 只保留为可选 static-client override，不是登录前置条件。项目不内置/冒用其他应用的 client ID，不读取任何外部 AI CLI 的凭据/缓存，也不执行外部 CLI 获取 token。服务端是否为某账号/Workspace 授予 Plan Usage，必须以真实授权结果为准。
-- 每次调用模型前检查 token 到期时间，按 Provider 加锁刷新，使用已签发 client ID 和 resource，尊重 `earliest_refresh_at`，原子替换整套 tokens、过期信息和 scopes。显式 scope 缩减立即生效，先保存 rotation 再拒绝未授权推理。此锁覆盖**同一进程**的并发 Feishu Session；不提供跨进程 refresh/auth-file read-modify-write 锁，应避免多个进程同时登录/修改/刷新同一 Store。
+- 每次调用模型前检查 token 到期时间，按 Provider 加锁刷新，使用已签发 client ID 和 resource，尊重 `earliest_refresh_at`，原子替换整套 tokens、过期信息和 scopes。显式 scope 缩减立即生效，先保存 rotation 再拒绝未授权推理。此锁覆盖**同一进程**的并发 Messaging Session；不提供跨进程 refresh/auth-file read-modify-write 锁，应避免多个进程同时登录/修改/刷新同一 Store。
 - HTTP/SDK 原始 request/config/header 不写日志；Provider 对 HTTP 错误仅报告状态码，对 transport/JSON 错误报告脱敏信息，避免服务端反射 Authorization。环境变量名称、Provider ID 和配置路径可以输出，凭据值不可以。
 - 自定义 Provider 可以读取发送给它的所有模型上下文，请仅使用可信网关。允许 HTTP localhost 是为了本地服务；远程含 Key 的连接应使用 HTTPS。
+
+Messaging 凭据只从 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `TELEGRAM_BOT_TOKEN` 环境变量读取；`channels` 配置只允许 enablement，拒绝 token / app_secret 等字段。Telegram API URL 包含 Bot Token，transport 错误和响应正文不原样输出，也不跟随重定向；不要启用会记录完整 URL 的 HTTP 代理日志。已有 webhook 不会被自动删除。
 
 以上是应用的数据流边界，不是对同一 OS 用户的强制文件隔离保证。**LocalExecutor 是 UNSAFE**，可主动读取宿主 `~/.claw/auth.json`；如果要让凭据与不可信 Agent 命令隔离，必须使用默认 Docker 后端，并确保工作区没有凭据副本、hardlink 或敏感挂载。
 
@@ -23,7 +25,7 @@
 
 Append / Usage 持久化失败会返回错误，不假装成功。尾部损坏 JSONL 记录可恢复，中间损坏明确拒绝；重建合法 Tool Chain 失败时拒绝推理。创建采用私密临时文件 + sync + 原子发布，追加按 Session 独立 mutex 与 sync。Snapshot / Offset 仅在 Write、Sync、Close 成功后发布；失败后保留最后提交状态并恢复尾部，恢复本身失败则拒绝继续提交，等待后续恢复重试。任务 Context 传到 Persistence，取消不会刻意打断已经开始的文件提交。崩溃在 Tool Call 与结果之间可能留下未完成链，当前拒绝恢复推理，不自动重跑有副作用的工具。
 
-M5.1 使用 **每 Session、单进程 writer ownership**：macOS / Linux 的 OS `flock` 作用于 SHA256(SessionID) 命名的 0600 `.lock` 文件。Demo 与飞书 worker 在会话运行生命周期内持有锁；Create / Append / Usage / Delete 均受保护，活动 Session 的外部 mutation 会被拒绝。只读 List / Show 不获取 writer lock，读取完整事件前缀，按现有规则忽略尾部 torn event。OS 在进程退出或崩溃后自动释放锁；保留 `.lock` 文件是正常行为，**不要删除活动锁文件**，否则新 inode 可能绕过已有锁。
+M5.1 使用 **每 Session、单进程 writer ownership**：macOS / Linux 的 OS `flock` 作用于 SHA256(SessionID) 命名的 0600 `.lock` 文件。Demo 与 Messaging worker 在会话运行生命周期内持有锁；Create / Append / Usage / Delete 均受保护，活动 Session 的外部 mutation 会被拒绝。只读 List / Show 不获取 writer lock，读取完整事件前缀，按现有规则忽略尾部 torn event。OS 在进程退出或崩溃后自动释放锁；保留 `.lock` 文件是正常行为，**不要删除活动锁文件**，否则新 inode 可能绕过已有锁。
 
 **Session writer lock 不是安全边界**，仅用于合作进程的一致性保护，不阻止同一 OS 用户、LocalExecutor 或其他绕过协议的程序直接修改文件。它不实现多进程同时写同一 Session，不覆盖 AuthStore / OAuth refresh，不提供分布式 / 网络文件系统锁保证。当前 writer lock 仅支持 macOS / Linux；其他平台的 mutation 会明确拒绝，而不是静默无锁运行。Session JSONL 仍是敏感本地明文数据，锁不提供保密性、磁盘加密、配额或安全擦除。
 
@@ -113,7 +115,7 @@ Explorer 的“只读”指 workspace 与 RootFS；允许写临时 `/tmp`。它�
 
 bind mount 禁用递归子挂载并采用 rprivate propagation，避免继承 workspace 内已有的其他挂载。Docker 参数通过 `exec.CommandContext("docker", args...)` 传递；mount 采用 CSV 编码，路径里的空格、逗号和引号不能注入额外挂载参数。禁止挂载 Docker socket，尤其是 `/var/run/docker.sock`。**network=none 不能阻止宿主 Unix socket 的访问**，所以 socket 不能作为普通项目文件暴露。
 
-Docker 不复制 `os.Environ()` 到容器。默认 `AllowedEnv` 是显式 Request.Env 的精确白名单：`PATH/LANG/LC_ALL/TERM`；未授权键被拒绝。宿主 `OPENAI_API_KEY/ZAI_CODING_CN_API_KEY/ZHIPU_API_KEY/GITHUB_TOKEN/AWS_*/SSH_*/FEISHU_APP_SECRET` 不会自动传入。Docker CLI 自身仍在受信任宿主上运行，按用户配置连接 daemon；这不等于把 CLI 的环境传给容器。
+Docker 不复制 `os.Environ()` 到容器。默认 `AllowedEnv` 是显式 Request.Env 的精确白名单：`PATH/LANG/LC_ALL/TERM`；未授权键被拒绝。宿主 `OPENAI_API_KEY/ZAI_CODING_CN_API_KEY/ZHIPU_API_KEY/GITHUB_TOKEN/AWS_*/SSH_*/FEISHU_APP_SECRET/TELEGRAM_BOT_TOKEN` 不会自动传入。Docker CLI 自身仍在受信任宿主上运行，按用户配置连接 daemon；这不等于把 CLI 的环境传给容器。
 
 镜像自身的 ENV 与入口文件也必须可信。不要把凭据烘焙进镜像，不要在 workspace 里放密钥、宿主 socket、敏感日志或业务数据。`.dockerignore` 避免构建基础镜像时发送项目和 workspace 内容；使用自定义镜像前需自行审查。
 
@@ -136,7 +138,7 @@ LocalExecutor 只适用于开发、调试或明确受信任环境。它仅设置
 
 Local 默认只继承少量基础变量（PATH、LANG、LC_ALL、TERM、HOME、TMPDIR），但这**不构成秘密隔离**：宿主文件、进程和用户权限仍可访问。
 
-必须显式 `-sandbox=local` 才能启用；启动时打印警告，飞书模式额外指出远程宿主执行风险。Local 无法强制只读，因此该模式的 Explorer 不注册 Bash，仅开放 `read_file`。不要把 Local + RO Policy 当作隔离环境。
+必须显式 `-sandbox=local` 才能启用；启动时打印警告，Messaging Gateway / 旧飞书模式额外指出远程宿主执行风险。Local 无法强制只读，因此该模式的 Explorer 不注册 Bash，仅开放 `read_file`。不要把 Local + RO Policy 当作隔离环境。
 
 ## 失败、取消与清理
 
@@ -157,7 +159,7 @@ docker rm --force <container-name>
 
 `IsDangerousCommand` 是 **Human Approval Layer** 的启发式规则，不是 **Security Boundary**。复杂 shell 表达式可能绕过正则。人工审批允许的是“在既定 Sandbox 权限内执行”，不是解除 RO、网络或资源限制。
 
-Prompt、AGENTS.md、SYSTEM.md、APPEND_SYSTEM.md 和 Skills 同样不是安全边界，Project Trust 也不授予任何 Sandbox 之外的权限。飞书远程接入还需要身份与访问控制、聊天作用域、审批权限和数据管理，不应在公开远程服务中启用 Local。
+Prompt、AGENTS.md、SYSTEM.md、APPEND_SYSTEM.md 和 Skills 同样不是安全边界，Project Trust 也不授予任何 Sandbox 之外的权限。飞书 / Telegram 远程接入还需要身份与访问控制、聊天作用域、审批权限和数据管理，不应在公开远程服务中启用 Local。当前没有用户 / Chat allowlist 或管理员角色校验；任何能向 bot 私聊或在群中触发它的人都可能运行任务，同一会话内的成员可以审批。Session 与 Approval 按 Channel / Account / Chat 隔离，不合并跨平台身份；这不隔离共享 Workspace 中的文件，也不构成用户授权。
 
 ## 验证与后续范围
 
@@ -171,6 +173,6 @@ go test -count=1 -v ./cmd/claw -run DockerSessionFactoryIntegration
 
 integration tests 验证 workspace 可访问/Coding 可写/Explorer 不可写、RootFS 只读、无外部路由与连接、宿主文件和凭证不可见，以及取消/超时后无新增遗留容器。网络测试使用 TEST-NET 地址，不依赖公网服务。Engine 测试使用 fake Provider + 真实 Docker，验证所有现有工具与失败 Recovery，不调用模型。
 
-daemon 或测试镜像不可用时 integration tests 可 Skip；**生产 auto 不允许安全降级**。可以通过 `CLAW_SANDBOX_TEST_IMAGE` 选择可信测试镜像。真实模型与飞书消息链路需另行验证。
+daemon 或测试镜像不可用时 integration tests 可 Skip；**生产 auto 不允许安全降级**。可以通过 `CLAW_SANDBOX_TEST_IMAGE` 选择可信测试镜像。真实模型与飞书 / Telegram 消息链路需另行验证。
 
 本阶段不实现 Kubernetes、gVisor、Firecracker、VM、bwrap、macOS sandbox-exec、网络白名单/credential proxy、SSH/远程 Executor 或长生命周期容器。现有 Executor 接口保留 streaming/cancel 扩展点，后续 Session Sandbox 不要求修改 AgentEngine。

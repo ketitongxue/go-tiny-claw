@@ -13,6 +13,7 @@ import (
 
 	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/channel"
+	"github.com/ketitongxue/go-tiny-claw/internal/config"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/executor"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
@@ -40,10 +41,10 @@ func TestStartupModesAndCredentialRequirements(t *testing.T) {
 		}
 		return ""
 	}
-	if err := validateEnvironment("demo", getenv); err != nil {
+	if err := validateEnvironment(config.ChannelsConfig{}, getenv); err != nil {
 		t.Fatalf("legacy demo must not require Feishu credentials: %v", err)
 	}
-	if err := validateEnvironment("feishu", getenv); err == nil || !strings.Contains(err.Error(), "FEISHU_APP_ID, FEISHU_APP_SECRET") || strings.Contains(err.Error(), "test-only-key") {
+	if err := validateEnvironment(config.ChannelsConfig{Feishu: config.ChannelConfig{Enabled: true}}, getenv); err == nil || !strings.Contains(err.Error(), "FEISHU_APP_ID, FEISHU_APP_SECRET") || strings.Contains(err.Error(), "test-only-key") {
 		t.Fatalf("missing credential names should be reported without values: %v", err)
 	}
 	for _, args := range [][]string{{"-mode", "invalid"}, {"-workdir", ""}, {"-model", ""}, {"-mode", "demo", "-prompt", ""}, {"unexpected"}} {
@@ -137,7 +138,7 @@ func TestRunSandboxFailureStopsBeforeModel(t *testing.T) {
 func TestLocalModeWarnsWithoutCheckingDocker(t *testing.T) {
 	// No CLI at all: local remains an explicit, usable opt-in.
 	t.Setenv("PATH", t.TempDir())
-	for _, mode := range []string{"demo", "feishu"} {
+	for _, mode := range []string{"demo", "feishu", "gateway"} {
 		var output bytes.Buffer
 		exec, err := configureSandbox(context.Background(), options{mode: mode, sandbox: executor.ModeLocal}, &output)
 		if err != nil {
@@ -153,6 +154,9 @@ func TestLocalModeWarnsWithoutCheckingDocker(t *testing.T) {
 		}
 		if mode == "feishu" && !strings.Contains(output.String(), "飞书远程请求") {
 			t.Fatal("missing Feishu-specific unsafe warning")
+		}
+		if mode == "gateway" && !strings.Contains(output.String(), "Messaging Gateway 远程请求") {
+			t.Fatal("missing gateway unsafe warning")
 		}
 	}
 }

@@ -30,13 +30,13 @@
 | AGENTS / SYSTEM / Skills | ✅ |
 | Project Trust | ✅ |
 | Messaging Gateway | ✅ |
-| 飞书长连接 | ✅ |
+| 飞书长连接 / Telegram Long Polling（文本） | ✅ |
+| 多通道同时在线 / 独立重连 | ✅ |
 | 多会话并行 | ✅ |
 | Human Approval | ✅ |
 | quiet / compact / verbose 消息模式 | ✅ |
 | Trace / Token / Cost 统计 | ✅ |
 | Benchmark | ✅ |
-| Telegram | 🚧 |
 | Git Checkpoint / Rollback | 🚧 |
 | Streaming / Steering | 🚧 |
 
@@ -51,7 +51,7 @@
                │                     │
           Messaging Gateway        Demo CLI
                │
-        Channel Adapter
+     Feishu / Telegram Adapters
                │
                ▼
           Conversation
@@ -84,7 +84,7 @@
                       Docker     Local
 ```
 
-一个 Conversation 对应一个独立 Session。同一 Conversation 串行执行，不同 Conversation 可以并行。
+一个 Conversation 对应一个独立 Session。同一 Conversation 串行执行，不同 Conversation 可以并行；不同 Channel / Account / Chat 的 Session 互相隔离。
 
 ---
 
@@ -97,7 +97,7 @@
 - Docker / Docker Desktop
 - Git
 - 对应模型 Provider 的凭据
-- 使用飞书模式时需要飞书应用凭据
+- 按启用的通道准备飞书应用凭据 / Telegram Bot Token
 
 检查：
 
@@ -223,34 +223,40 @@ claw session delete <session-id>
 
 ---
 
-# 飞书
+# Messaging Gateway：飞书 + Telegram
 
-设置：
+在 `~/.claw/config.json` 中合并以下配置（保留已有模型等设置）：
+
+```json
+{
+  "channels": {
+    "feishu": { "enabled": true },
+    "telegram": { "enabled": true }
+  },
+  "messaging": { "report_mode": "compact" }
+}
+```
+
+只要求已启用通道的环境变量；凭据不能写入 config.json 或 Workspace：
 
 ```bash
 export FEISHU_APP_ID="..."
 export FEISHU_APP_SECRET="..."
+export TELEGRAM_BOT_TOKEN="..."
+
+claw gateway -workdir ./workspace
 ```
 
-启动：
+可仅启用其中一个通道。未配置 / 未启用任何通道时，`claw gateway` 明确报错，不自动猜测。旧的 `claw -mode feishu` 暂时保留并打印弃用警告，始终只启动飞书；`claw -mode demo` 不变。
 
-```bash
-claw \
-  -mode feishu \
-  -workdir ./workspace
-```
+- 两个平台同时在线，私聊直接对话；群聊 `@bot`，Telegram 也支持回复 bot 的消息。
+- 不同 Channel / Chat 独立 Durable Session，重启自动恢复，不跨平台绑定身份或共享历史。
+- 同 Chat 顺序执行、不同 Chat 并行；共享审批与消息展示策略，Adapter 自行切分长文本。
+- 一个通道临时失败会独立退避重连，不停止另一个；一个永久失败也不影响另一个，全部永久失败才退出。Ctrl+C 统一取消。
 
-当前支持：
+Telegram 使用 BotFather 创建的 Bot Token，仅 Long Polling + 纯文本。已有 webhook 会明确拒绝启动，**不会自动 deleteWebhook**；请自行移除 webhook，并确保同一 token 只有一个 update consumer。群聊开启 Privacy Mode 时，请通过 `@bot` 或回复 bot 交互；审批文本也应回复 bot 的消息。
 
-- 私聊
-- 群聊 `@bot`
-- 多 Chat 独立 Session
-- 同 Chat 顺序执行
-- 不同 Chat 并行
-- Session 自动恢复
-- Human Approval
-- 消息去重
-- 长消息切片
+机器人仅供可信用户使用；当前没有用户 / Chat allowlist 或管理员身份校验，审批作用域是会话，不是用户权限。
 
 ---
 
@@ -464,7 +470,7 @@ Local:
 
 Bash 将直接以当前操作系统用户权限运行。
 
-> 不建议将 `Feishu + LocalExecutor` 用于无人值守远程执行。
+> 不建议将 `Messaging Gateway + LocalExecutor` 用于无人值守远程执行。
 
 详细安全说明见：
 
@@ -475,6 +481,10 @@ Bash 将直接以当前操作系统用户权限运行。
 # 常用命令
 
 ```bash
+# Messaging
+claw gateway -workdir ./workspace
+claw gateway -check-config  # 仅本地检查，不联网验证通道
+
 # 模型
 claw models
 claw model current

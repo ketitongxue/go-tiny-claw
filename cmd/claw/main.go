@@ -21,7 +21,6 @@ import (
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
 	"github.com/ketitongxue/go-tiny-claw/internal/executor"
-	"github.com/ketitongxue/go-tiny-claw/internal/feishu"
 	"github.com/ketitongxue/go-tiny-claw/internal/gateway"
 	"github.com/ketitongxue/go-tiny-claw/internal/observability"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
@@ -48,9 +47,14 @@ type options struct {
 
 func parseOptions(args []string, output io.Writer) (options, error) {
 	var opts options
-	fs := flag.NewFlagSet("claw", flag.ContinueOnError)
+	commandName, defaultMode := "claw", "feishu"
+	gatewayCommand := len(args) > 0 && args[0] == "gateway"
+	if gatewayCommand {
+		commandName, defaultMode, args = "claw gateway", "gateway", args[1:]
+	}
+	fs := flag.NewFlagSet(commandName, flag.ContinueOnError)
 	fs.SetOutput(output)
-	fs.StringVar(&opts.mode, "mode", "feishu", "运行模式：feishu（长连接）或 demo（原终端演示）")
+	fs.StringVar(&opts.mode, "mode", defaultMode, "兼容模式：feishu（已弃用，改用 claw gateway）或 demo（终端演示）")
 	fs.StringVar(&opts.workDir, "workdir", "workspace", "工具、会话、技能和 Trace 共用的工作区")
 	fs.StringVar(&opts.model, "model", "", "模型 provider/model；默认读取全局 config.json")
 	fs.StringVar(&opts.resume, "resume", "", "恢复已有 demo Session ID")
@@ -66,8 +70,13 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	if fs.NArg() != 0 {
 		return opts, fmt.Errorf("不支持位置参数，请通过 -prompt 指定 demo 指令")
 	}
-	if opts.mode != "feishu" && opts.mode != "demo" {
-		return opts, fmt.Errorf("未知运行模式 %q，可选 feishu 或 demo", opts.mode)
+	modeExplicit := false
+	fs.Visit(func(f *flag.Flag) { modeExplicit = modeExplicit || f.Name == "mode" })
+	if gatewayCommand && modeExplicit {
+		return opts, errors.New("claw gateway 不支持 -mode；请在 config.json 中启用 channels")
+	}
+	if !gatewayCommand && opts.mode != "feishu" && opts.mode != "demo" {
+		return opts, fmt.Errorf("未知运行模式 %q，可选 feishu 或 demo；多通道请使用 claw gateway", opts.mode)
 	}
 	if err := executor.ValidateMode(opts.sandbox); err != nil {
 		return opts, err
@@ -93,23 +102,6 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	}
 	opts.workDir = workDir
 	return opts, nil
-}
-
-func validateEnvironment(mode string, getenv func(string) string) error {
-	var required []string
-	if mode == "feishu" {
-		required = append(required, "FEISHU_APP_ID", "FEISHU_APP_SECRET")
-	}
-	var missing []string
-	for _, key := range required {
-		if strings.TrimSpace(getenv(key)) == "" {
-			missing = append(missing, key)
-		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("缺少环境变量: %s；请在本机设置后重新启动（参见 README.md）", strings.Join(missing, ", "))
-	}
-	return nil
 }
 
 // Executors are immutable/stateless; each Execute creates its own process or container.
@@ -172,6 +164,8 @@ func configureSandbox(ctx context.Context, opts options, output io.Writer) (exec
 		fmt.Fprint(output, localExecutorWarning)
 		if opts.mode == "feishu" {
 			fmt.Fprintln(output, "WARNING: 飞书远程请求将直接执行宿主命令；人工审批不是 Sandbox。")
+		} else if opts.mode == "gateway" {
+			fmt.Fprintln(output, "WARNING: Messaging Gateway 远程请求将直接执行宿主命令；人工审批不是 Sandbox。")
 		}
 	}
 	exec, err := executor.NewConfigured(ctx, opts.sandbox, opts.sandboxImage, executor.CodingPolicy())
@@ -212,11 +206,18 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	if err != nil {
 		return err
 	}
-	if err := validateEnvironment(opts.mode, os.Getenv); err != nil {
-		return err
+	if opts.mode == "feishu" {
+		fmt.Fprintln(output, "WARNING: -mode feishu is deprecated; use claw gateway")
 	}
 	runtime, err := loadRuntime()
 	if err != nil {
+		return err
+	}
+	enabledChannels, err := channelsForMode(opts.mode, runtime.Config.Channels)
+	if err != nil {
+		return err
+	}
+	if err := validateEnvironment(enabledChannels, os.Getenv); err != nil {
 		return err
 	}
 	opts.contextPolicy = runtime.Config.Context
@@ -229,7 +230,7 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	var resumed *ctxpkg.Session
 	if opts.resume != "" {
 		if opts.mode != "demo" {
-			return errors.New("-resume 仅用于 demo；飞书自动恢复")
+			return errors.New("-resume 仅用于 demo；Messaging Gateway 自动恢复 Session")
 		}
 		resumed, err = service.Resume(ctx, opts.resume)
 		if err != nil {
@@ -256,7 +257,7 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 		}
 	}
 	model, credentialInfo, err := runtime.Manager.Inspect(ctx, ref)
-	if err != nil && (opts.mode != "feishu" || opts.checkConfig) {
+	if err != nil && (opts.mode == "demo" || opts.checkConfig) {
 		return fmt.Errorf("所选/默认模型 %s 不可用: %w。请运行 claw auth login 或指定 -model", ref, err)
 	}
 	opts.modelInfo = model
@@ -273,7 +274,7 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 		} else if credentialInfo.NeedsRefresh {
 			fmt.Fprintln(output, "OAuth token 已过期或即将过期；运行时需刷新（本检查未联网）。")
 		}
-		fmt.Fprintln(output, "尚未验证 Sandbox、凭证有效性、网络连接或飞书收发消息。")
+		fmt.Fprintln(output, "尚未验证 Sandbox、凭证有效性、网络连接或 Channel 收发消息。")
 		return nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -282,7 +283,7 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	if err := os.MkdirAll(opts.workDir, 0o755); err != nil {
 		return fmt.Errorf("创建工作区失败: %w", err)
 	}
-	// Discover warnings before serving Feishu or contacting a model. Runtime
+	// Discover warnings before serving channels or contacting a model. Runtime
 	// prompt builds still reload resources so later trust/revocation is observed.
 	resources, err := (ctxpkg.ResourceLoader{Home: runtime.Paths.Home}).Load(opts.workDir)
 	for _, d := range resources.Diagnostics {
@@ -307,17 +308,15 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 		localOpts.modelInfo = m
 		return newSessionEngine(p, sess, reporter, localOpts, executors, approvals), nil
 	}
-	if opts.mode == "feishu" {
+	if opts.mode != "demo" {
 		reportingPolicy, err := runtime.Config.Messaging.ReportingPolicy()
 		if err != nil {
 			return err
 		}
-		adapter, err := feishu.NewAdapter()
+		channelConfig := runtime.Config
+		channelConfig.Channels = enabledChannels
+		channels, err := configureChannels(channelConfig)
 		if err != nil {
-			return err
-		}
-		channels := channel.NewRegistry()
-		if err := channels.Register(adapter); err != nil {
 			return err
 		}
 		sessions := gateway.DurableSessions{Service: service, LegacyID: legacyFeishuSessionID,
@@ -333,7 +332,11 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 		if err != nil {
 			return err
 		}
-		log.Printf("[Gateway] 启动飞书事件长连接，工作区: %s，模型: %s", opts.workDir, opts.model)
+		var ids []string
+		for _, a := range channels.All() {
+			ids = append(ids, a.ID())
+		}
+		log.Printf("[Gateway] 启动 Messaging Gateway (%s)，工作区: %s，模型: %s", strings.Join(ids, ", "), opts.workDir, opts.model)
 		return gw.Run()
 	}
 

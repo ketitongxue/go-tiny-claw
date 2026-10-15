@@ -41,7 +41,7 @@ func NewAdapter() (*Adapter, error) {
 	appID := strings.TrimSpace(os.Getenv("FEISHU_APP_ID"))
 	appSecret := strings.TrimSpace(os.Getenv("FEISHU_APP_SECRET"))
 	if appID == "" || appSecret == "" {
-		return nil, errors.New("请设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
+		return nil, channel.Permanent(errors.New("请设置 FEISHU_APP_ID 和 FEISHU_APP_SECRET"))
 	}
 	return &Adapter{appID: appID, appSecret: appSecret, client: lark.NewClient(appID, appSecret,
 		lark.WithLogLevel(larkcore.LogLevelInfo), lark.WithReqTimeout(10*time.Second), lark.WithEnableTokenCache(true))}, nil
@@ -57,10 +57,10 @@ func (b *Adapter) GetEventDispatcher() *dispatcher.EventDispatcher {
 
 func (b *Adapter) Start(ctx context.Context, handler channel.InboundHandler) error {
 	if b == nil || b.client == nil {
-		return errors.New("飞书 Adapter 未初始化")
+		return channel.Permanent(errors.New("飞书 Adapter 未初始化"))
 	}
 	if handler == nil {
-		return errors.New("飞书 Adapter 需要消息处理器")
+		return channel.Permanent(errors.New("飞书 Adapter 需要消息处理器"))
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -70,23 +70,52 @@ func (b *Adapter) Start(ctx context.Context, handler channel.InboundHandler) err
 	b.mu.Lock()
 	if b.started {
 		b.mu.Unlock()
-		return errors.New("飞书 Adapter 已启动")
+		return channel.Permanent(errors.New("飞书 Adapter 已启动"))
 	}
 	b.started, b.ctx, b.handler = true, ctx, handler
 	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		b.started, b.ctx, b.handler = false, nil, nil
+		b.mu.Unlock()
+	}()
 	if err := b.loadBotIdentity(ctx); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		log.Printf("[Feishu] 无法确认机器人身份，群聊任务暂不可用；私聊继续: %v", err)
 	}
+	failed := make(chan error, 1)
+	signalFailure := func(err error) {
+		select {
+		case failed <- classifyConnectionError(err):
+		default:
+		}
+	}
 	client := larkws.NewClient(b.appID, b.appSecret,
 		larkws.WithEventHandler(b.GetEventDispatcher()),
+		// Gateway owns retry timing. Surface post-connect disconnects too: the
+		// pinned SDK's Start otherwise remains parked after a disconnect.
+		larkws.WithAutoReconnect(false),
+		larkws.WithOnError(signalFailure),
+		larkws.WithOnDisconnected(func() { signalFailure(errors.New("connection closed")) }),
 		// SDK info logs include connection URLs; keep tickets out of logs.
 		larkws.WithLogLevel(larkcore.LogLevelWarn),
 		larkws.WithOnReady(func() { log.Print("[Feishu] 长连接已建立，等待消息") }),
 	)
-	return b.serveConnection(ctx, client)
+	return classifyConnectionError(b.serveConnectionUntil(ctx, client, failed))
+}
+
+func classifyConnectionError(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || channel.IsPermanent(err) {
+		return err
+	}
+	var rejected *larkws.ClientError
+	if errors.As(err, &rejected) {
+		return channel.Permanent(fmt.Errorf("飞书长连接配置/认证失败 (code=%d)", rejected.Code))
+	}
+	// SDK transport errors may contain connection URLs/tickets.
+	return errors.New("飞书长连接中断或请求失败")
 }
 
 // The pinned SDK exposes bot/v3/info via authenticated raw Get. Identity, not
@@ -137,16 +166,23 @@ type longConnection interface {
 }
 
 func (b *Adapter) serveConnection(ctx context.Context, client longConnection) error {
+	return b.serveConnectionUntil(ctx, client, nil)
+}
+
+func (b *Adapter) serveConnectionUntil(ctx context.Context, client longConnection, failed <-chan error) error {
 	connectionCtx, cancel := context.WithCancel(ctx)
 	defer b.stopConnection(client, cancel)
-	// SDK v3.9.10 Start parks in select{} after connecting. Close explicitly
-	// on cancellation; its parked goroutine remains until CLI process exit.
+	// SDK v3.9.10 Start parks in select{}; its heartbeat also ignores ctx.
+	// Close the socket explicitly on exit. These SDK background goroutines
+	// remain until process exit (including after a supervised reconnect).
 	errCh := make(chan error, 1)
 	go func() { errCh <- client.Start(connectionCtx) }()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-errCh:
+		return err
+	case err := <-failed:
 		return err
 	}
 }

@@ -25,11 +25,22 @@ func (c MessagingConfig) ReportingPolicy() (delivery.ReportingPolicy, error) {
 	return delivery.ReportingPolicy{Mode: mode}, err
 }
 
+// ChannelConfig contains no credentials. Secrets are read from the environment.
+type ChannelConfig struct {
+	Enabled bool `json:"enabled"`
+}
+
+type ChannelsConfig struct {
+	Feishu   ChannelConfig `json:"feishu,omitempty"`
+	Telegram ChannelConfig `json:"telegram,omitempty"`
+}
+
 type Config struct {
 	DefaultModel string               `json:"default_model"`
 	Language     string               `json:"language,omitempty"`
 	Context      ctxpkg.ContextPolicy `json:"context,omitempty"`
 	Messaging    MessagingConfig      `json:"messaging,omitempty"`
+	Channels     ChannelsConfig       `json:"channels,omitempty"`
 }
 
 func Load(path string) (Config, error) {
