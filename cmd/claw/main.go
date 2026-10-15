@@ -308,6 +308,10 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 		return newSessionEngine(p, sess, reporter, localOpts, executors, approvals), nil
 	}
 	if opts.mode == "feishu" {
+		reportingPolicy, err := runtime.Config.Messaging.ReportingPolicy()
+		if err != nil {
+			return err
+		}
 		adapter, err := feishu.NewAdapter()
 		if err != nil {
 			return err
@@ -325,7 +329,7 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 				return service.Create(callCtx, id, opts.workDir, selected, string(info.Type))
 			}}
 		gw, err := gateway.New(ctx, gateway.Config{Channels: channels, ResolveSession: sessions.Resolve,
-			Factory: factory, Approvals: approval.NewApprovalManager()})
+			Factory: factory, Approvals: approval.NewApprovalManager(), ReportingPolicy: reportingPolicy})
 		if err != nil {
 			return err
 		}

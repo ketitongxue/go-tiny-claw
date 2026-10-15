@@ -7,16 +7,29 @@ import (
 	"unicode"
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
+	"github.com/ketitongxue/go-tiny-claw/internal/delivery"
 	"github.com/ketitongxue/go-tiny-claw/internal/fileutil"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 )
 
 const FallbackModel = "zai-coding-cn/glm-5.3"
 
+type MessagingConfig struct {
+	ReportMode string `json:"report_mode,omitempty"`
+}
+
+// ReportingPolicy is the configuration boundary: Gateway receives a typed
+// policy and never parses user-supplied strings. An empty value means compact.
+func (c MessagingConfig) ReportingPolicy() (delivery.ReportingPolicy, error) {
+	mode, err := delivery.ParseReportMode(c.ReportMode)
+	return delivery.ReportingPolicy{Mode: mode}, err
+}
+
 type Config struct {
 	DefaultModel string               `json:"default_model"`
 	Language     string               `json:"language,omitempty"`
 	Context      ctxpkg.ContextPolicy `json:"context,omitempty"`
+	Messaging    MessagingConfig      `json:"messaging,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -29,6 +42,9 @@ func Load(path string) (Config, error) {
 		return c, err
 	}
 	if err := validateLanguage(c.Language); err != nil {
+		return c, err
+	}
+	if _, err := c.Messaging.ReportingPolicy(); err != nil {
 		return c, err
 	}
 	if c.Context.DefaultContextWindow < 0 || c.Context.DefaultReservedOutput < 0 || c.Context.MaxToolResultTokens < 0 || c.Context.SafetyMarginPercent < 0 || c.Context.SafetyMarginPercent >= 100 {
@@ -48,6 +64,9 @@ func validateLanguage(language string) error {
 
 func Save(path string, c Config) error {
 	if err := validateLanguage(c.Language); err != nil {
+		return err
+	}
+	if _, err := c.Messaging.ReportingPolicy(); err != nil {
 		return err
 	}
 	if _, err := provider.ParseModelRef(c.DefaultModel); err != nil {

@@ -13,6 +13,7 @@ import (
 	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
+	"github.com/ketitongxue/go-tiny-claw/internal/delivery"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
 	"github.com/ketitongxue/go-tiny-claw/internal/schema"
@@ -34,11 +35,12 @@ type sentMessage struct {
 	msg   channel.OutboundMessage
 }
 type fakeAdapter struct {
-	id      string
-	inbound chan inboundDelivery
-	sent    chan sentMessage
-	started chan struct{}
-	stopped chan struct{}
+	id       string
+	inbound  chan inboundDelivery
+	sent     chan sentMessage
+	started  chan struct{}
+	stopped  chan struct{}
+	sendHook func(context.Context, channel.Route, channel.OutboundMessage) error
 }
 
 func newFakeAdapter(id string) *fakeAdapter {
@@ -58,6 +60,11 @@ func (a *fakeAdapter) Start(ctx context.Context, handler channel.InboundHandler)
 	}
 }
 func (a *fakeAdapter) Send(ctx context.Context, route channel.Route, msg channel.OutboundMessage) error {
+	if a.sendHook != nil {
+		if err := a.sendHook(ctx, route, msg); err != nil {
+			return err
+		}
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -79,7 +86,17 @@ func receive[T any](t *testing.T, ch <-chan T) T {
 func inbound(chat, id, text string) channel.InboundMessage {
 	return channel.InboundMessage{ID: id, Route: channel.Route{Channel: "test", AccountID: "default", ChatID: chat}, ChatType: channel.ChatDirect, Text: text, ReceivedAt: time.Now()}
 }
-func testGateway(t *testing.T, factory RuntimeFactory) (*Gateway, *fakeAdapter, *sessionstore.MemoryStore) {
+func receiveTaskReport(t *testing.T, a *fakeAdapter) sentMessage {
+	t.Helper()
+	for {
+		out := receive(t, a.sent)
+		if out.msg.Text != "🤖 已收到，正在处理……" {
+			return out
+		}
+	}
+}
+
+func testGateway(t *testing.T, factory RuntimeFactory, policies ...delivery.ReportingPolicy) (*Gateway, *fakeAdapter, *sessionstore.MemoryStore) {
 	t.Helper()
 	a := newFakeAdapter("test")
 	registry := channel.NewRegistry()
@@ -92,7 +109,12 @@ func testGateway(t *testing.T, factory RuntimeFactory) (*Gateway, *fakeAdapter, 
 	sessions := DurableSessions{Service: svc, Create: func(ctx context.Context, id string) (*ctxpkg.Session, error) {
 		return svc.Create(ctx, id, dir, provider.ModelInfo{ProviderID: "fake", ID: "pinned"}, "none")
 	}}
-	g, err := New(context.Background(), Config{Channels: registry, ResolveSession: sessions.Resolve, Factory: factory, Approvals: approval.NewApprovalManager()})
+	var policy delivery.ReportingPolicy
+	if len(policies) != 0 {
+		policy = policies[0]
+	}
+	g, err := New(context.Background(), Config{Channels: registry, ResolveSession: sessions.Resolve, Factory: factory,
+		Approvals: approval.NewApprovalManager(), ReportingPolicy: policy})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,9 +148,11 @@ func TestFakeAdapterEndToEnd(t *testing.T) {
 	if err := receive(t, ack); err != nil {
 		t.Fatal(err)
 	}
-	out := receive(t, a.sent)
-	if out.route != msg.Route || out.msg.Text != "reply: hello" || out.msg.Kind != channel.OutboundText {
-		t.Fatalf("wrong delivery: %+v", out)
+	for _, want := range []string{acceptedText, "reply: hello"} {
+		out := receive(t, a.sent)
+		if out.route != msg.Route || out.msg.Kind != channel.OutboundText || out.msg.Text != want {
+			t.Fatalf("wrong delivery: %+v; want %q", out, want)
+		}
 	}
 	g.Cancel()
 	if err := receive(t, done); !errors.Is(err, context.Canceled) {
@@ -240,7 +264,7 @@ func TestQueueFullIsRetryableNotRemembered(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	processed := make(chan string, ConversationQueueSize+2)
-	g, _, _ := testGateway(t, func(_ context.Context, _ *ctxpkg.Session, _ channel.Route, _ engine.Reporter, _ *approval.Service) (AgentRunner, error) {
+	g, a, _ := testGateway(t, func(_ context.Context, _ *ctxpkg.Session, _ channel.Route, _ engine.Reporter, _ *approval.Service) (AgentRunner, error) {
 		return runnerFunc(func(ctx context.Context, s *ctxpkg.Session, _ engine.Reporter) error {
 			h := s.GetWorkingMemory(0)
 			text := h[len(h)-1].Content
@@ -258,19 +282,29 @@ func TestQueueFullIsRetryableNotRemembered(t *testing.T) {
 	})
 	admit(t, g, inbound("a", "first", "block"))
 	receive(t, started)
+	if out := receive(t, a.sent); out.msg.Text != acceptedText {
+		t.Fatal("missing accepted notification", out)
+	}
 	for i := range ConversationQueueSize {
 		id := fmt.Sprint(i)
 		admit(t, g, inbound("a", id, id))
+		if out := receive(t, a.sent); out.msg.Text != acceptedText {
+			t.Fatal("missing queued task accepted notification", out)
+		}
 	}
 	overflow := inbound("a", "overflow", "retry")
 	if err := g.Receive(context.Background(), overflow); !errors.Is(err, ErrQueueFull) {
 		t.Fatal("missing backpressure", err)
 	}
+	assertNoDelivery(t, a)
 	close(release)
 	for range ConversationQueueSize + 1 {
 		receive(t, processed)
 	}
 	admit(t, g, overflow)
+	if out := receive(t, a.sent); out.msg.Text != acceptedText {
+		t.Fatal("retry missing accepted notification", out)
+	}
 	if receive(t, processed) != "retry" {
 		t.Fatal("retry lost")
 	}
@@ -294,11 +328,14 @@ func TestApprovalBypassesQueueAndIsScoped(t *testing.T) {
 				}), nil
 			})
 			admit(t, g, inbound("a", "1", "danger"))
-			notice := receive(t, a.sent)
+			notice := receiveTaskReport(t, a)
 			if !strings.Contains(notice.msg.Text, "approve task123") {
 				t.Fatal(notice)
 			}
 			admit(t, g, inbound("a", "2", "queued"))
+			if out := receive(t, a.sent); out.msg.Text != acceptedText {
+				t.Fatal("queued task missing accepted notification", out)
+			}
 			wrong := inbound("b", "3", "approve task123")
 			wrong.ChatType = channel.ChatGroup
 			admit(t, g, wrong)
@@ -316,6 +353,7 @@ func TestApprovalBypassesQueueAndIsScoped(t *testing.T) {
 				t.Fatal("unexpected resolution")
 			}
 			receive(t, next)
+			assertNoDelivery(t, a) // approve/reject (including retries) never ACK.
 		})
 	}
 }
@@ -344,7 +382,7 @@ func TestShutdownStopsActiveApprovalAndQueuedMessageReleasesWriters(t *testing.T
 	receive(t, active)
 	admit(t, g, inbound("active", "2", "queued"))
 	admit(t, g, inbound("approval", "3", "danger"))
-	receive(t, a.sent)
+	receiveTaskReport(t, a)
 	if err := g.Shutdown(); err != nil {
 		t.Fatal(err)
 	}

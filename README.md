@@ -47,6 +47,7 @@
 | 多会话                                 | ✅           |
 | 飞书长连接                               | ✅ 默认入口      |
 | Messaging Gateway Core              | ✅ Adapter / Conversation Runtime 解耦 |
+| Messaging Presentation Policy       | ✅ quiet / compact（默认）/ verbose |
 | 同会话顺序执行                             | ✅           |
 | 不同飞书会话并行                            | ✅           |
 | Human Approval                      | ✅           |
@@ -134,7 +135,7 @@ M5.3 消息链路独立于平台 SDK：
 Feishu SDK → Feishu Adapter → InboundMessage → Gateway
                                                ├→ Command Router → Approval
                                                └→ Conversation Manager → Queue → Durable Session → AgentEngine
-AgentEngine → ChannelReporter → DeliveryService → ChannelRegistry → Feishu Adapter
+AgentEngine → ChannelReporter → ReportingPolicy → DeliveryService → ChannelRegistry → Feishu Adapter
 ```
 
 每个 Route（channel/account/chat/thread）对应独立 Session；同 Conversation 串行，不同 Conversation 并行。审批命令绕过普通队列，群聊普通消息仍要求明确 @ 自己的 bot，群聊 approve/reject 回复无需 mention。Adapter 只做连接、平台事件转换和发送，不创建 Session/Engine。Demo 继续使用 TerminalReporter。本轮只接入单账号飞书，不做跨平台身份合并或多平台启动。
@@ -194,7 +195,7 @@ go-tiny-claw/
 │   │
 │   ├── channel/                  # Adapter / Route / Message / Registry
 │   ├── gateway/                  # Conversation / Queue / Dedup / Session Resolve
-│   ├── delivery/                 # DeliveryService / ChannelReporter
+│   ├── delivery/                 # DeliveryService / ChannelReporter / ReportingPolicy
 │   ├── approval/                 # Session-scoped Approval / Dangerous Policy
 │   ├── feishu/
 │   │   └── adapter.go            # Long Connection / Mention / API / Chunking
@@ -318,7 +319,7 @@ CLI → ModelRef → ProviderManager → LLMProvider → AgentEngine
 
 ```text
 ~/.claw/                         # 全局配置，不是 Agent 工作区
-├── config.json                  # 普通配置：default_model / language / context
+├── config.json                  # 普通配置：default_model / language / context / messaging
 ├── AGENTS.md                    # 用户级默认指令，可选
 ├── SYSTEM.md                    # 用户级 core 替换，可选
 ├── APPEND_SYSTEM.md             # 用户级追加，可选
@@ -854,6 +855,52 @@ go run ./cmd/claw \
 ```
 
 启动后程序通过飞书长连接等待消息。
+
+---
+
+## 消息展示策略（M5.3.1）
+
+所有 Messaging Channel 共用全局 `config.json` 的 `messaging.report_mode`，支持 `quiet`、`compact`、`verbose`。未配置或空字符串默认 **compact**；拼写错误会在启动时明确报错，不静默降级。修改后需重启。
+
+示例（模型名应替换为自己实际可用的模型）：
+
+```json
+{
+  "default_model": "openai/gpt-6.1-sol",
+  "language": "zh-CN",
+  "messaging": {
+    "report_mode": "compact"
+  }
+}
+```
+
+| 消息 | quiet | compact（默认）| verbose |
+| --- | --- | --- | --- |
+| Task Accepted | 隐藏 | 展示 | 隐藏 |
+| Thinking | 隐藏 | 隐藏 | 展示 |
+| Tool Call | 隐藏 | 隐藏 | 展示 |
+| Tool Success | 隐藏 | 隐藏 | 展示 |
+| Tool Error | 隐藏 | 隐藏 | 展示 |
+| Final Message | 展示 | 展示 | 展示 |
+| Fatal Task Error | 展示 | 展示 | 展示 |
+| Approval Request | 展示 | 展示 | 展示 |
+
+默认聊天体验：
+
+```text
+🤖 已收到，正在处理……
+
+项目分析如下：
+...
+```
+
+**Tool Error 不等于 Task Error。** Agent 可以阅读失败工具的 stderr 并自行恢复；compact/quiet 不逐条发送内部工具错误。只有任务最终失败（例如 `AgentRunner.Run` 返回 error）或 Session/模型初始化、持久化失败，才显示对应任务错误。审批是等待用户决策的控制面消息，所有模式都发送；审批发送失败仍拒绝操作。
+
+Accepted 只在成功入队、记住 dedup key 并释放 Gateway admission 锁后尝试发送；重复消息、队列满、群聊未 @、approve/reject 控制命令和空消息均不发送。发送失败仅记录日志，不撤销任务、不返回 Handler error。展示层保证先完成 Accepted 的发送尝试，再发送本会话正文/任务错误/审批；慢通知不会占用 Gateway 大锁或阻塞其他 Conversation。
+
+策略仅作用于 `ChannelReporter`。`-mode demo` 的 `TerminalReporter` 仍显示 Thinking、工具调用、成功/失败和正文；Engine、Session history、Trace、Subagent 和审批决策流程不变。隐藏聊天 telemetry 不等于脱敏或删除 Session/Trace，其中仍可能包含路径、命令、代码及 stdout/stderr。不会额外发送“任务完成”气泡。
+
+本轮不支持消息编辑、进度卡片、`/verbose` 等聊天命令或 per-channel 模式。验收与限制见 [M5.3.1 Report](docs/M5.3.1-report.md)。
 
 ---
 
@@ -1650,11 +1697,12 @@ Race / 静态检查与 Session Store 性能观测：
 ```bash
 go test -race ./...
 go vet ./...
+go test -race -count=10 ./internal/gateway ./internal/delivery ./internal/channel
 go test -bench=FileStore -benchmem ./internal/sessionstore
 go test -bench=Prompt -benchmem ./internal/context/...
 ```
 
-Prompt Main/Explorer Golden 使用固定虚拟路径，位于 `internal/context/testdata/`。修改规则后审查 diff，再显式运行 `go test ./internal/context -run TestPromptGolden -update-prompt-golden` 更新；不要盲目刷新。M5.2 架构、测试及人工验收见 [M5.2 Report](docs/M5.2-report.md)。M5.3 Gateway/飞书迁移、Legacy 兼容及人工验收见 [M5.3 Report](docs/M5.3-report.md)。
+Prompt Main/Explorer Golden 使用固定虚拟路径，位于 `internal/context/testdata/`。修改规则后审查 diff，再显式运行 `go test ./internal/context -run TestPromptGolden -update-prompt-golden` 更新；不要盲目刷新。M5.2 架构、测试及人工验收见 [M5.2 Report](docs/M5.2-report.md)。M5.3 Gateway/飞书迁移、Legacy 兼容及人工验收见 [M5.3 Report](docs/M5.3-report.md)。M5.3.1 消息展示策略、测试与飞书验收见 [M5.3.1 Report](docs/M5.3.1-report.md)。
 
 FileStore Benchmark 比较 100 / 1000 条历史消息的单次 Append（包含 fsync）；不设绝对耗时 SLA。确定性测试另外验证 fast path 不读取完整历史，并覆盖跨进程冲突、活动 Session 只读访问及 SIGKILL 后锁释放。M5.1 变更与人工验收见 [M5.1 Report](docs/M5.1-report.md)。
 
@@ -1865,7 +1913,7 @@ Task Deadline
 建议后续演进方向：
 
 ```text
-1. Session Persistence / Hardening、Prompt Architecture、Messaging Gateway（M5 / M5.1 / M5.2 / M5.3 已实现，M5.2 / M5.3 等待人工验收）
+1. Session Persistence / Hardening、Prompt Architecture、Messaging Gateway / Presentation Policy（M5 / M5.1 / M5.2 / M5.3 / M5.3.1 已实现，飞书实际体验等待人工验收）
 2. Git Checkpoint / Diff / Rollback（不自动开始 M6）
 3. Task Verifier
 4. Streaming / Cancel / Steering

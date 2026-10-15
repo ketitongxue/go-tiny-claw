@@ -10,6 +10,7 @@ import (
 	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
+	"github.com/ketitongxue/go-tiny-claw/internal/delivery"
 	"github.com/ketitongxue/go-tiny-claw/internal/engine"
 	"github.com/ketitongxue/go-tiny-claw/internal/gateway"
 	"github.com/ketitongxue/go-tiny-claw/internal/provider"
@@ -81,7 +82,10 @@ func newTestRuntime(t *testing.T, dir string, resolver gateway.SessionResolver, 
 		cancel()
 		t.Fatal(err)
 	}
-	g, err := gateway.New(ctx, gateway.Config{Channels: registry, ResolveSession: resolver, Factory: factory, Approvals: approvals})
+	// Legacy adapter regressions explicitly exercise verbose rendering. Compact
+	// presentation is covered at the channel-independent Gateway boundary.
+	g, err := gateway.New(ctx, gateway.Config{Channels: registry, ResolveSession: resolver, Factory: factory,
+		Approvals: approvals, ReportingPolicy: delivery.ReportingPolicy{Mode: delivery.ReportModeVerbose}})
 	if err != nil {
 		cancel()
 		t.Fatal(err)

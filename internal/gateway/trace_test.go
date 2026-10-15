@@ -33,7 +33,7 @@ func TestMessagingRootTraceDimensionsAndAddressRedaction(t *testing.T) {
 	msg.UserID = "private-user-address"
 	admit(t, g, msg)
 	s := receive(t, sessions)
-	receive(t, a.sent)
+	receiveTaskReport(t, a)
 	if err := g.Shutdown(); err != nil {
 		t.Fatal(err)
 	}

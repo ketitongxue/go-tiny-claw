@@ -93,7 +93,7 @@ func TestRuntimeFactoryErrorRetriesWithoutReresolvingSession(t *testing.T) {
 	})
 	admit(t, g, inbound("a", "1", "first"))
 	first := receive(t, sessions)
-	out := receive(t, a.sent)
+	out := receiveTaskReport(t, a)
 	if out.msg.Kind != channel.OutboundError {
 		t.Fatal("factory error not delivered", out)
 	}

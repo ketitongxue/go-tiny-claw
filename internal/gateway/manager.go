@@ -14,15 +14,16 @@ import (
 // ConversationManager holds one worker/writer per canonical route. No disk,
 // provider, approval notification or delivery work runs under the map lock.
 type ConversationManager struct {
-	ctx           context.Context
-	resolve       SessionResolver
-	factory       RuntimeFactory
-	delivery      *delivery.Service
-	approvals     *approval.ApprovalManager
-	mu            sync.Mutex
-	conversations map[string]*Conversation
-	workers       sync.WaitGroup
-	closeErr      error
+	ctx             context.Context
+	resolve         SessionResolver
+	factory         RuntimeFactory
+	delivery        *delivery.Service
+	approvals       *approval.ApprovalManager
+	reportingPolicy delivery.ReportingPolicy
+	mu              sync.Mutex
+	conversations   map[string]*Conversation
+	workers         sync.WaitGroup
+	closeErr        error
 }
 
 func (m *ConversationManager) getOrCreate(route channel.Route) (*Conversation, error) {
@@ -36,7 +37,7 @@ func (m *ConversationManager) getOrCreate(route channel.Route) (*Conversation, e
 		return c, nil
 	}
 	c := &Conversation{Route: route, key: key, queue: make(chan channel.InboundMessage, ConversationQueueSize),
-		reporter: delivery.NewChannelReporter(m.delivery, route)}
+		reporter: delivery.NewChannelReporter(m.delivery, route, m.reportingPolicy)}
 	m.conversations[key] = c
 	m.workers.Add(1)
 	go c.run(m.ctx, m)

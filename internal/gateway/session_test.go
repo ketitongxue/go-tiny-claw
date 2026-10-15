@@ -83,7 +83,7 @@ func TestLegacyResumeApprovalAndRestartKeepActualIDModelHistory(t *testing.T) {
 		if s.ID != "old-chat" || s.ModelRef().String() != "fake/old-model" || s.GetWorkingMemory(0)[0].Content != "ABC123" {
 			t.Fatal("legacy session forked or lost model/history")
 		}
-		receive(t, a.sent)
+		receiveTaskReport(t, a)
 		admit(t, g, inbound("old-chat", "approval", "approve task"))
 		if !receive(t, results) {
 			t.Fatal("router used canonical instead of actual legacy approval ID")
@@ -214,12 +214,12 @@ func TestSessionIOAndRuntimeErrorsDoNotBlockOtherConversations(t *testing.T) {
 	receive(t, blocked)
 	admit(t, g, inbound("b", "2", "fast"))
 	receive(t, runs)
-	out := receive(t, a.sent)
+	out := receiveTaskReport(t, a)
 	if !strings.Contains(out.msg.Text, "❌ Agent 运行失败") || out.msg.Kind != channel.OutboundError {
 		t.Fatal(out)
 	}
 	close(release)
-	out = receive(t, a.sent)
+	out = receiveTaskReport(t, a)
 	if !strings.Contains(out.msg.Text, "❌ Session 恢复失败") {
 		t.Fatal(out)
 	}

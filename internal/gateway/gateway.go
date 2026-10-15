@@ -18,10 +18,11 @@ var ErrQueueFull = errors.New("当前会话队列已满，请稍后重试")
 
 // Register adapters before Run. Approval is optional and scoped to this gateway.
 type Config struct {
-	Channels       *channel.Registry
-	ResolveSession SessionResolver
-	Factory        RuntimeFactory
-	Approvals      *approval.ApprovalManager
+	Channels        *channel.Registry
+	ResolveSession  SessionResolver
+	Factory         RuntimeFactory
+	Approvals       *approval.ApprovalManager
+	ReportingPolicy delivery.ReportingPolicy
 }
 
 type Gateway struct {
@@ -42,7 +43,8 @@ func New(ctx context.Context, cfg Config) (*Gateway, error) {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	m := &ConversationManager{ctx: ctx, resolve: cfg.ResolveSession, factory: cfg.Factory,
-		delivery: delivery.NewService(cfg.Channels), approvals: cfg.Approvals, conversations: make(map[string]*Conversation)}
+		delivery: delivery.NewService(cfg.Channels), approvals: cfg.Approvals,
+		reportingPolicy: cfg.ReportingPolicy, conversations: make(map[string]*Conversation)}
 	return &Gateway{ctx: ctx, cancel: cancel, channels: cfg.Channels, conversations: m,
 		commands: commandRouter{approvals: cfg.Approvals, conversations: m}}, nil
 }
@@ -66,41 +68,60 @@ func (g *Gateway) Receive(ctx context.Context, msg channel.InboundMessage) error
 	if _, ok := g.channels.Get(msg.Route.Channel); !ok {
 		return fmt.Errorf("channel %q is not registered", msg.Route.Channel)
 	}
+	notifyAccepted, err := g.admit(ctx, msg)
+	if err != nil {
+		return err
+	}
+	// Admission has released g.mu. Network I/O must never serialize unrelated
+	// conversations. Notification failure cannot undo enqueue or trigger retry.
+	if notifyAccepted != nil {
+		notifyAccepted(ctx)
+	}
+	return nil
+}
+
+// admit keeps dedup/enqueue atomic and returns a notification only for a newly
+// accepted ordinary task. It performs no delivery under the admission lock.
+func (g *Gateway) admit(ctx context.Context, msg channel.InboundMessage) (func(context.Context), error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if err := g.ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	if strings.TrimSpace(msg.Text) == "" {
-		return nil
+		return nil, nil
 	}
 	now := time.Now()
 	key := DedupKey(msg)
 	if g.dedup.contains(key, now) {
-		return nil
+		return nil, nil
 	}
 	if g.commands.handle(msg) {
 		g.dedup.remember(key, now)
-		return nil
+		return nil, nil
 	}
 	// Adapters establish MentionedBot using their platform identity/metadata.
 	// Plain control replies remain usable in a group without a mention.
 	if msg.ChatType == channel.ChatGroup && !msg.MentionedBot {
-		return nil
+		return nil, nil
 	}
 	c, err := g.conversations.getOrCreate(msg.Route)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	// Reserve output order before the worker can consume the message. This is
+	// presentation-only bookkeeping: it never waits on or sends to an adapter.
+	notifyAccepted, discardAccepted := c.reporter.PrepareAccepted()
 	select {
 	case c.queue <- msg:
 		g.dedup.remember(key, now)
-		return nil
+		return notifyAccepted, nil
 	default:
-		return ErrQueueFull
+		discardAccepted()
+		return nil, ErrQueueFull
 	}
 }
 
