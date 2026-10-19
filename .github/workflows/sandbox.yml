@@ -1,0 +1,75 @@
+name: Sandbox contracts
+
+on:
+  workflow_dispatch:
+  push:
+    paths: ['internal/executor/**', 'cmd/claw/**', 'Dockerfile.sandbox', '.github/workflows/sandbox.yml']
+  pull_request:
+    paths: ['internal/executor/**', 'cmd/claw/**', 'Dockerfile.sandbox', '.github/workflows/sandbox.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Explicitly provision SRT test dependencies
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install -y bubblewrap socat ripgrep curl
+          else
+            brew install ripgrep
+          fi
+          # Reviewed schema fixture, NOT a claimed minimum supported version.
+          npm install -g @anthropic-ai/sandbox-runtime@0.0.80
+          # Native intentionally does not open arbitrary HOME/toolcache trees.
+          # Expose only this trusted Go SDK and Node through system locations.
+          go_root="$(go env GOROOT)"
+          if [[ "$go_root" != /usr/local/go ]]; then
+            if [[ -e /usr/local/go || -L /usr/local/go ]]; then
+              sudo mv /usr/local/go /usr/local/go.before-sandbox-tests
+            fi
+            sudo ln -s "$go_root" /usr/local/go
+          fi
+          node_binary="$(command -v node)"
+          sudo ln -sf "$node_binary" /usr/local/bin/node
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            # The sandbox's fixed PATH prioritizes OS tools (not brew bash).
+            # Do not accidentally select an older distro Node in this test VM.
+            sudo ln -sf "$node_binary" /usr/bin/node
+          fi
+          srt --version
+      - name: Native contracts and security regressions (no skip on enforcement failure)
+        run: |
+          go test -count=1 -v ./internal/executor -run '^TestSandboxContract/Native$'
+          go test -count=1 -v ./internal/executor -run 'Native|SRT|Network|Backend|Capability|Workspace'
+          go test -count=1 -v ./cmd/claw -run 'NativeSessionFactoryIntegration|NativeStartupRejectsWorkspaceSRTBeforeExecution'
+      - run: go vet ./...
+
+  docker:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: docker build -f Dockerfile.sandbox -t go-tiny-claw-sandbox:latest .
+      - run: docker version
+      - run: |
+          go test -count=1 -v ./internal/executor -run '^TestSandboxContract/Docker$'
+          go test -count=1 -v ./internal/executor -run 'Docker|Backend|Capability'
+      - run: go test -count=1 ./...

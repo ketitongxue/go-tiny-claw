@@ -43,6 +43,9 @@ func loadRuntime() (*app.Runtime, error) {
 	return app.Load(paths, os.Getenv)
 }
 func dispatchCommand(ctx context.Context, args []string, cio commandIO) (bool, error) {
+	if len(args) > 0 && args[0] == "sandbox" {
+		return true, sandboxCommand(ctx, args[1:], cio.output)
+	}
 	if len(args) > 0 && (args[0] == "trust" || args[0] == "prompt") {
 		return true, promptResourceCommand(ctx, args, cio)
 	}

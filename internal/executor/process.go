@@ -14,8 +14,8 @@ import (
 )
 
 func canonicalWorkDir(workDir string) (string, error) {
-	if strings.TrimSpace(workDir) == "" {
-		return "", fmt.Errorf("%w: path is empty", ErrInvalidWorkDir)
+	if strings.TrimSpace(workDir) == "" || workDir == "~" || strings.HasPrefix(workDir, "~/") {
+		return "", fmt.Errorf("%w: path is empty or unexpanded HOME", ErrInvalidWorkDir)
 	}
 	absolute, err := filepath.Abs(workDir)
 	if err != nil {

@@ -33,6 +33,11 @@ func TestPolicyValidation(t *testing.T) {
 		func(p *SandboxPolicy) { p.Timeout = 0 },
 		func(p *SandboxPolicy) { p.AllowedEnv = []string{"TOKEN=bad"} },
 		func(p *SandboxPolicy) { p.AllowedEnv = []string{"1BAD"} },
+		func(p *SandboxPolicy) { p.AllowedEnv = []string{"HOME"} },
+		func(p *SandboxPolicy) { p.AllowedEnv = []string{"TMPDIR"} },
+		func(p *SandboxPolicy) { p.AllowedEnv = []string{"CLAW_HOME"} },
+		func(p *SandboxPolicy) { p.AllowedEnv = []string{"CLAUDE_CODE_TMPDIR"} },
+		func(p *SandboxPolicy) { p.ResourceEnforcement = "pretend" },
 	} {
 		policy := CodingPolicy()
 		mutate(&policy)

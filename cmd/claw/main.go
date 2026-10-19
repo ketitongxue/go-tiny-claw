@@ -36,13 +36,14 @@ const demoPrompt = `为了加快执行速度，请你在一轮回复中，【同
 请确保你是分别调用两个不同的工具，不要试图把它们合并成一个命令！`
 
 type options struct {
-	mode, workDir, model, prompt, resume string
-	sandbox, sandboxImage                string
-	thinking, plan, checkConfig          bool
-	modelInfo                            provider.ModelInfo
-	authType                             string
-	contextPolicy                        ctxpkg.ContextPolicy
-	promptHome, language                 string
+	mode, workDir, model, prompt, resume          string
+	sandbox, sandboxImage                         string
+	sandboxPolicy, sandboxNetwork, sandboxDomains string
+	thinking, plan, checkConfig                   bool
+	modelInfo                                     provider.ModelInfo
+	authType                                      string
+	contextPolicy                                 ctxpkg.ContextPolicy
+	promptHome, language                          string
 }
 
 func parseOptions(args []string, output io.Writer) (options, error) {
@@ -59,8 +60,11 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 	fs.StringVar(&opts.model, "model", "", "模型 provider/model；默认读取全局 config.json")
 	fs.StringVar(&opts.resume, "resume", "", "恢复已有 demo Session ID")
 	fs.StringVar(&opts.prompt, "prompt", demoPrompt, "demo 模式下执行的指令")
-	fs.StringVar(&opts.sandbox, "sandbox", executor.ModeAuto, "Bash 执行后端：auto（仅 Docker，失败拒绝启动）、docker、local（不安全）")
+	fs.StringVar(&opts.sandbox, "sandbox", executor.ModeAuto, "Bash 后端：auto（按策略/能力优先 Native）、native（Anthropic SRT）、docker（强制资源限制）、local（UNSAFE）")
 	fs.StringVar(&opts.sandboxImage, "sandbox-image", executor.DefaultImage, "预先构建的 Docker Sandbox 镜像")
+	fs.StringVar(&opts.sandboxPolicy, "sandbox-policy", "coding", "应用策略：coding（资源 best-effort）或 strict（强制 memory/cpu/pids）")
+	fs.StringVar(&opts.sandboxNetwork, "sandbox-network", "denied", "应用网络策略：denied、allowlist 或 unrestricted（Native 不支持）")
+	fs.StringVar(&opts.sandboxDomains, "sandbox-allowed-domains", "", "allowlist 域名/IP，逗号分隔；不是模型工具参数")
 	fs.BoolVar(&opts.thinking, "thinking", false, "开启独立思考阶段")
 	fs.BoolVar(&opts.plan, "plan", false, "开启 PLAN.md / TODO.md 任务续接")
 	fs.BoolVar(&opts.checkConfig, "check-config", false, "仅检查本地启动配置，不连接服务、不调用模型")
@@ -79,6 +83,9 @@ func parseOptions(args []string, output io.Writer) (options, error) {
 		return opts, fmt.Errorf("未知运行模式 %q，可选 feishu 或 demo；多通道请使用 claw gateway", opts.mode)
 	}
 	if err := executor.ValidateMode(opts.sandbox); err != nil {
+		return opts, err
+	}
+	if _, err := applicationSandboxPolicy(opts, false); err != nil {
 		return opts, err
 	}
 	if err := executor.ValidateImage(opts.sandboxImage); err != nil {
@@ -168,14 +175,23 @@ func configureSandbox(ctx context.Context, opts options, output io.Writer) (exec
 			fmt.Fprintln(output, "WARNING: Messaging Gateway 远程请求将直接执行宿主命令；人工审批不是 Sandbox。")
 		}
 	}
-	exec, err := executor.NewConfigured(ctx, opts.sandbox, opts.sandboxImage, executor.CodingPolicy())
+	policy, err := applicationSandboxPolicy(opts, false)
+	if err != nil {
+		return nil, err
+	}
+	exec, err := executor.NewConfigured(ctx, opts.sandbox, opts.sandboxImage, opts.workDir, policy)
 	if err != nil {
 		return nil, fmt.Errorf("未检测到可用 Sandbox 或初始化失败: %w\n不会回退到 Local。若确认环境可信，可显式使用：claw -sandbox=local", err)
 	}
-	if docker, ok := exec.(*executor.DockerExecutor); ok {
-		if err := docker.ValidateWorkspace(ctx, opts.workDir); err != nil {
+	if validator, ok := exec.(interface {
+		ValidateWorkspace(context.Context, string) error
+	}); ok {
+		if err := validator.ValidateWorkspace(ctx, opts.workDir); err != nil {
 			return nil, err
 		}
+	}
+	if reporter, ok := exec.(interface{ Status() executor.Status }); ok {
+		fmt.Fprint(output, reporter.Status().String())
 	}
 	return exec, nil
 }
@@ -189,11 +205,23 @@ func configureExecutors(ctx context.Context, opts options, output io.Writer) (se
 		fmt.Fprintln(output, "Explorer 已禁用 Bash：LocalExecutor 无法强制只读；仅开放 read_file。")
 		return sessionExecutors{coding: coding}, nil
 	}
-	// The same image/daemon was checked above, but this is a separate executor
-	// with an immutable RO policy, never the main agent's RW executor.
-	explorer, err := executor.NewDockerExecutor(opts.sandboxImage, executor.ExplorerPolicy())
+	// Pin Explorer to the actual selected backend, with a separate immutable
+	// RO policy. Never share Coding's RW executor or reroute during Execute.
+	policy, err := applicationSandboxPolicy(opts, true)
 	if err != nil {
 		return sessionExecutors{}, err
+	}
+	backend := coding.(interface{ Status() executor.Status }).Status().Backend
+	explorer, err := executor.NewConfigured(ctx, backend, opts.sandboxImage, opts.workDir, policy)
+	if err != nil {
+		return sessionExecutors{}, err
+	}
+	if validator, ok := explorer.(interface {
+		ValidateWorkspace(context.Context, string) error
+	}); ok {
+		if err := validator.ValidateWorkspace(ctx, opts.workDir); err != nil {
+			return sessionExecutors{}, err
+		}
 	}
 	return sessionExecutors{coding: coding, explorer: explorer}, nil
 }

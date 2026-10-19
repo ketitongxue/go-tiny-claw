@@ -15,11 +15,11 @@
 
 Messaging 凭据只从 `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `TELEGRAM_BOT_TOKEN` 环境变量读取；`channels` 配置只允许 enablement，拒绝 token / app_secret 等字段。Telegram API URL 包含 Bot Token，transport 错误和响应正文不原样输出，也不跟随重定向；不要启用会记录完整 URL 的 HTTP 代理日志。已有 webhook 不会被自动删除。
 
-以上是应用的数据流边界，不是对同一 OS 用户的强制文件隔离保证。**LocalExecutor 是 UNSAFE**，可主动读取宿主 `~/.claw/auth.json`；如果要让凭据与不可信 Agent 命令隔离，必须使用默认 Docker 后端，并确保工作区没有凭据副本、hardlink 或敏感挂载。
+以上是应用的数据流边界，不是对同一 OS 用户的强制文件隔离保证。**LocalExecutor 是 UNSAFE**，可主动读取宿主 `~/.claw/auth.json`；如果要让凭据与不可信 Agent 命令隔离，必须使用通过能力与隔离检查的 Native / Docker 后端（strict 资源策略使用 Docker），并确保工作区没有凭据副本、hardlink 或敏感挂载。
 
 ## Session Store：Sensitive Local Data
 
-完整对话、用户 Prompt、代码内容、Tool Output、Agent Response 与累计 Usage 存在全局 `~/.claw/sessions/`（或 `CLAW_HOME/sessions`），**不放在 workspace**，也不默认挂载到 Docker。Agent Home / sessions 为 0700，JSONL 文件为 0600；Session ID 经 SHA256 映射到文件名，真实 ID 只保存在事件中。禁止提交、分享或复制到 workspace。LocalExecutor 仍可按宿主权限读取这些文件，权限不隔离同一 OS 用户。
+完整对话、用户 Prompt、代码内容、Tool Output、Agent Response 与累计 Usage 存在全局 `~/.claw/sessions/`（或 `CLAW_HOME/sessions`），**不放在 workspace**，Native 默认禁止读取，Docker 也不默认挂载。Agent Home / sessions 为 0700，JSONL 文件为 0600；Session ID 经 SHA256 映射到文件名，真实 ID 只保存在事件中。禁止提交、分享或复制到 workspace。LocalExecutor 仍可按宿主权限读取这些文件，权限不隔离同一 OS 用户。
 
 事件 schema v1 保存 session_created、完整 schema.Message、usage、metadata_updated；不保存 API Key 或 OAuth Access/Refresh/ID Token。模型 identity 固定，恢复只消费 ProviderManager / AuthManager 的解析与 refresh 能力。用户主动把秘密贴进 Prompt 或代码时，秘密仍可能进入对话记录；本模块不进行正文秘密检测或加密。
 
@@ -86,14 +86,50 @@ OAuth 推理仅用 `POST https://api.openai.com/v1/responses` + Bearer，强制 
 本版本为 **Bash 命令**提供可插拔的执行后端：
 
 ```text
-Agent → Human Approval Policy → BashTool → Executor → OS
-                                               ├ LocalExecutor（UNSAFE）
-                                               └ DockerExecutor + SandboxPolicy
+Agent → Human Approval Policy → BashTool → Executor
+                                           ├ NativeExecutor → Anthropic SRT → OS sandbox
+                                           ├ DockerExecutor → Docker
+                                           └ LocalExecutor → host（UNSAFE）
 ```
 
-Tool 不决定权限。主 Agent 使用 CodingPolicy（workspace RW），Explorer 使用独立的 ExplorerPolicy（workspace RO）。默认 `-sandbox=auto` 仅选择 Docker；CLI、daemon、镜像或参数检查失败均报错退出，运行中失败也不会切换 Local。
+Tool 不决定权限。主 Agent 使用 CodingPolicy（workspace RW），Explorer 使用独立的 ExplorerPolicy（workspace RO）。默认 `-sandbox=auto` 按 RequiredCapabilities 先检查 Native，再检查 Docker；两者均不满足则拒绝启动，永远不会选择 Local。`StrictCodingPolicy()` 要求 CPU/Memory/PID 三项强制限制，因此只可选择 Docker。CodingPolicy / ExplorerPolicy 的资源默认是 best-effort：Native **完全不提供这些资源上限**，但仍强制超时、文件和网络策略；Docker 即使 best-effort 也始终执行全部资源上限。
 
-受信任组件包括：主进程与其配置、宿主 OS、Docker CLI/daemon/runtime、所选镜像，以及批准任务的用户。模型生成的命令与代码不应被视为可信。支持本机 Docker / Docker Desktop 的 Linux 容器；远程 Docker context、VM 与远程 Executor 不在本阶段支持范围内。
+`-sandbox=native|docker` 不会选择另一个后端。后端选择只发生在构建 Executor 时，返回单一具体 Executor，不存在运行时 routing executor。**Native Execute 失败 → Docker 重试、Docker Execute 失败 → Native 重试、任意后端失败 → Local 全部禁止**：命令可能已经产生部分副作用，必须把原错误交给调用方，不能跨后端重放。
+
+受信任组件包括：主进程与其应用层配置、宿主 OS、SRT CLI/Node/依赖和系统工具链、Docker CLI/daemon/runtime、所选镜像，以及批准任务的用户。模型生成的命令与代码不应被视为可信。支持本机 Docker / Docker Desktop 的 Linux 容器；远程 Docker context、VM 与远程 Executor 不在本阶段支持范围内。
+
+## Native Sandbox（Anthropic SRT）
+
+直接调用外部 `srt --settings <private-file> -c <command>`，不把 SRT TypeScript 重写成 Go，不自行实现 Seatbelt profile、bubblewrap、HTTP/SOCKS proxy 或 cgroup。
+
+- macOS 使用 sandbox-exec / Seatbelt；Linux 使用 bubblewrap（包括 SRT 的 PID/network namespace 与 seccomp）；网络只经过 SRT controlled HTTP/SOCKS proxy。它不是 VM，也不等价于 Docker 的资源隔离。
+- 不使用 SRT 的“默认全盘可读”。filesystem builder 显式 `denyRead: /`，仅重新开放 canonical workspace、私有 runtime、有限的系统 binary/library/SDK/CA 文件。真实 HOME、sibling projects、`~/.claw`（auth/session/host）、`.ssh/.aws/.kube/.config` 与独立 `CLAW_HOME` 均不可读；不因为命令失败而重新开放整个 HOME。Npm 安装的 SRT 只有在验证包名和 CLI 位置后才可重新开放其精确安装目录（只读，用于 vendored seccomp helper），不会开放整个 node_modules 或 HOME。
+- Coding workspace RW，Explorer workspace RO；临时 HOME/TMPDIR 可写。SRT 自带的共享 `/tmp/claude` 写入便利路径被明确禁止。Linux SRT read-deny 可能把目录呈现为临时空 tmpfs；其中的 shadow 写入不代表能修改对应宿主文件，且随 namespace 消失。
+- 每次 Execute 在短系统路径 `/tmp` 下创建独立 `go-tiny-claw-sandbox-*`（macOS canonical path 为 `/private/tmp/...`），不继承宿主 TMPDIR 作为根目录，避免 SRT 内部 Unix socket 超过 sockaddr_un 长度限制：目录、home、tmp 为 0700，settings.json 为 0600、exclusive create；绝不使用真实 HOME。SRT 的 TMPDIR override 被固定到本次私有 tmp，settings 本身禁止写入。不传 control-fd，不读取用户 `.srt-settings.json`。
+- 默认不继承宿主环境；仅复制 LANG/LC_ALL/TERM，使用有限系统 PATH，加上隔离的 HOME/TMPDIR 与必要的受控 runtime 设置。macOS 仅从已允许的系统 SDK 路径选择 canonical DEVELOPER_DIR，供 Apple git/clang launcher 使用，不开放整个 `/var` 或 HOME；系统 curl 所需的公开 `/private/etc/ssl/openssl.cnf` 单文件经过审查后允许读取，不开放 SSL private-key 目录。宿主代理、API key、GitHub/AWS/SSH agent/Feishu secret 等不继承。Request.Env 必须满足精确 AllowedEnv，且只在进入 sandbox **之后**应用，不能把 NODE_OPTIONS/BASH_ENV 等送给宿主 SRT 触发代码。HOME/TMPDIR/CLAW_HOME/runtime temp override 是保留键。Git 不读取宿主 system/global config，仅把当前 canonical workspace 传给 SRT 的 git.safeDirectories，以适配 Linux user namespace 的 UID 映射，不使用通配 `*`。
+- 不提供 memory/CPU/PID 强制限制，best-effort **不是**假装执行了这些值。需要限制时使用 strict + Docker；explicit native + strict 立即报缺失 memory,cpu,pids。
+- 成功、非零退出、SRT 启动失败、超时、取消均删除私有 runtime，清理失败返回错误，不隐藏；SIGKILL/崩溃/掉电仍可能留下私密目录。普通 Unix 子进程按进程组取消；macOS 上蓄意逃离进程组的 daemon 不保证清理，但仍继承 OS sandbox。Native 不是持久会话或 PID 配额控制器。
+
+安装（必须由用户明确执行，程序不会安装）：
+
+```bash
+npm install -g @anthropic-ai/sandbox-runtime
+srt --version
+```
+
+启动不只 LookPath：**首次执行任何 SRT 代码之前（包括 `--version`）**，构造函数必须取得启动 workspace，canonicalize workspace 与 SRT 可执行文件，拒绝 workspace 与可执行文件/npm 包安装目录重叠（包括符号链接别名），并检查包名及安装目录不与凭据路径重叠。路径检查失败时不会运行版本或隔离探测；auto 只可在构建期另选符合策略的 Docker。随后，5s `--version` 必须正常报告版本，再运行有界、本地 fixture 隔离探测，验证显式 missing/empty/invalid settings 必须拒绝（不准 SRT fallback 默认配置）、literal-path schema、workspace RW、读取禁止、RO、网络默认 deny、allowlist、direct TCP 与 Unix socket 阻断。缺少必要 curl/Node/SRT/OS 依赖、旧 SRT 忽略配置或 seccomp 不可用而放行 socket，均不能通过探测。源格式依据上游 npm 0.0.80 审查，并已在 macOS / Node 26.8.2 上安装 SRT 0.0.80，通过真实 contract、工具链、网络、凭据、取消与清理测试。0.0.80 是已实测基线，**不是未经比较就宣称的最低版本**；不捏造 minimum semver。以版本报告 + 实际 enforcement probes fail closed；升级 SRT 后必须重跑真实 integration tests。
+
+系统安装的 Go（`/usr/local/go`）、OS git/bash/curl 与明确列出的 SDK 路径可用；HOME 下的 nvm/pyenv、用户 module cache、任意 Homebrew SDK 不会自动重新开放。使用系统工具链、workspace vendoring/cache 或 Docker，不得用开放 HOME 来“修复”。SRT 自身的 Node/rg/bwrap/socat 也必须能在受控系统 PATH 找到。
+
+## 网络语义与应用配置
+
+| Policy | Native | Docker |
+| --- | --- | --- |
+| NetworkEnabled=false | deny，忽略 dormant domain list | network=none |
+| enabled + 非空 AllowedDomains | SRT 精确 domain/IP（可选 port）与 `*.example.com` allowlist | **unsupported，拒绝** |
+| enabled + 空 AllowedDomains | **unrestricted unsupported，拒绝** | bridge，无域名过滤 |
+
+CodingPolicy 不硬编码 GitHub/Go 等域名。应用 CLI 可配置 `-sandbox-network=allowlist -sandbox-allowed-domains=github.com,proxy.golang.org`；不允许空 allowlist 或广泛 `*`。`-sandbox-network=unrestricted` 的 auto 只能选择 Docker。模型不能通过 Bash tool 参数改 policy/domains；Approval 也不能增加权限。Allowlist 是目标域名边界，不是 URL/path/内容过滤；允许的服务仍可能接收 workspace 数据。
 
 ## Docker Sandbox 能保护什么
 
@@ -101,9 +137,9 @@ Tool 不决定权限。主 Agent 使用 CodingPolicy（workspace RW），Explore
 
 - **未挂载的宿主文件**：仅 WorkDir 绑定到 `/workspace`。宿主 HOME、SSH Key、云凭证等不会因容器中的同名路径而可见。
 - **宿主大部分进程**：使用 Docker 默认私有 PID namespace；不挂载宿主 proc，不使用 host PID 或 privileged。
-- **RootFS**：`--read-only`；临时文件和 Go 缓存使用 128 MB `/tmp` tmpfs。`touch /root/test` 失败。
+- **RootFS**：`--read-only`；临时文件和 Go 缓存使用 128 MB `/tmp` tmpfs，保留原有 noexec/nosuid/nodev 行为。Go 的 GOTMPDIR 指向已经允许执行的 workspace，以便 Coding 的 `go test` 可执行测试二进制，不把 tmpfs 改成 exec；Explorer 因 workspace RO 不能在那里构建。`touch /root/test` 失败。
 - **默认网络**：`--network none`，无外部网络路由；模型不能通过 Bash 参数打开网络。curl 外部连接失败。
-- **资源**：memory 与 memory-swap 均限制为 Policy 的内存，CPU quota、PID 数量和命令超时有界。Coding 为 1024 MB / 2 CPU / 128 PIDs / 30s；Explorer 为 512 MB / 1 CPU / 64 PIDs / 30s。
+- **资源**：构建及每次命令执行前检查 daemon 的 memory/swap/CPU quota/period/PID capability，拒绝会警告后忽略 flags 的 cgroup-less / 不支持的 daemon；不是只凭 CLI 参数宣称已限制。memory 与 memory-swap 均限制为 Policy 的内存，CPU quota、PID 数量和命令超时有界。Coding 为 1024 MB / 2 CPU / 128 PIDs / 30s；Explorer 为 512 MB / 1 CPU / 64 PIDs / 30s。
 - **提权能力**：drop ALL capabilities，`no-new-privileges=true`，保留 Docker 默认 seccomp，不授予额外权限。
 - **Explorer workspace 写入**：readonly bind mount 由 OS 拒绝重定向、删除、mkdir、sed -i 等写操作，不依赖 Prompt 或命令正则。
 
@@ -111,11 +147,11 @@ Explorer 的“只读”指 workspace 与 RootFS；允许写临时 `/tmp`。它�
 
 ## 挂载与环境变量
 
-执行前 WorkDir 必须非空、存在且为目录，通过 absolute path + symlink canonicalization。禁止挂载 `/`、整个 HOME 及其祖先、HOME 的 `.ssh/.aws/.config` 目录及其后代、Docker socket 或其父目录。工作区中存在宿主 Unix socket/设备时拒绝执行。正常的 HOME 下项目目录可用。
+执行前 WorkDir 必须非空、存在且为目录，通过 absolute path + symlink canonicalization。两后端共享检查：禁止 `/`、整个 HOME 及其祖先，禁止与 HOME 的 `.claw/.ssh/.aws/.kube/.config`、独立 CLAW_HOME、Docker socket 或 SSH_AUTH_SOCK 危险重叠（包括祖先与后代）。无法 canonicalize 不猜测路径。工作区中存在宿主 Unix socket/设备/FIFO（包括指向它们的 symlink）时拒绝执行。正常的 HOME 下项目目录可用。
 
 bind mount 禁用递归子挂载并采用 rprivate propagation，避免继承 workspace 内已有的其他挂载。Docker 参数通过 `exec.CommandContext("docker", args...)` 传递；mount 采用 CSV 编码，路径里的空格、逗号和引号不能注入额外挂载参数。禁止挂载 Docker socket，尤其是 `/var/run/docker.sock`。**network=none 不能阻止宿主 Unix socket 的访问**，所以 socket 不能作为普通项目文件暴露。
 
-Docker 不复制 `os.Environ()` 到容器。默认 `AllowedEnv` 是显式 Request.Env 的精确白名单：`PATH/LANG/LC_ALL/TERM`；未授权键被拒绝。宿主 `OPENAI_API_KEY/ZAI_CODING_CN_API_KEY/ZHIPU_API_KEY/GITHUB_TOKEN/AWS_*/SSH_*/FEISHU_APP_SECRET/TELEGRAM_BOT_TOKEN` 不会自动传入。Docker CLI 自身仍在受信任宿主上运行，按用户配置连接 daemon；这不等于把 CLI 的环境传给容器。
+Docker 不复制 `os.Environ()` 到容器，显式固定 HOME/TMPDIR=/tmp，仅把 /workspace 设为 Git safe.directory 以处理 Docker Desktop UID 映射。默认 `AllowedEnv` 是显式 Request.Env 的精确白名单：`PATH/LANG/LC_ALL/TERM`；未授权键被拒绝。宿主 `OPENAI_API_KEY/ZAI_CODING_CN_API_KEY/ZHIPU_API_KEY/GITHUB_TOKEN/AWS_*/SSH_*/FEISHU_APP_SECRET/TELEGRAM_BOT_TOKEN` 不会自动传入。Docker CLI 自身仍在受信任宿主上运行，按用户配置连接 daemon；这不等于把 CLI 的环境传给容器。
 
 镜像自身的 ENV 与入口文件也必须可信。不要把凭据烘焙进镜像，不要在 workspace 里放密钥、宿主 socket、敏感日志或业务数据。`.dockerignore` 避免构建基础镜像时发送项目和 workspace 内容；使用自定义镜像前需自行审查。
 
@@ -124,7 +160,7 @@ Docker 不复制 `os.Environ()` 到容器。默认 `AllowedEnv` 是显式 Reques
 - **Coding workspace 的完整性与保密性**：RW workspace 可被删除、覆盖或恶意修改；RO workspace 的内容也仍可被读取并返回给模型。
 - **显式挂进去的宿主文件**：挂载内容本身即对容器开放。选择 WorkDir 时必须使用干净的项目副本，而不是宽泛的系统目录。
 - **显式允许的环境变量**：扩大 AllowedEnv、传入凭据或把凭据写入文件会主动扩大暴露范围。
-- **显式启用的网络**：程序化 `NetworkEnabled=true` 使用 bridge，不具备域名白名单、代理或凭据保护。本版 CLI 没有网络开关。
+- **显式启用的网络**：`NetworkEnabled=true` 且 AllowedDomains 为空时使用 bridge，不具备域名白名单、代理或凭据保护。非空 allowlist 必须拒绝，不能悄悄变成 bridge allow-all。
 - **Docker runtime / 内核漏洞**：容器不是独立内核的 VM，不能承诺抵御容器逃逸。需维护和升级宿主、daemon 与可信镜像。
 - **整个 Agent 主进程**：Provider、read/write/edit 文件工具、会话、Trace 等仍在宿主执行；文件工具有 workspace 路径检查，但不是 OS Sandbox。此改动不将整个 Agent 容器化。
 - **宿主文件竞态与特殊文件关系**：canonicalization 和扫描不能原子锁定挂载源；并发重命名、symlink 变化、hardlink 与其他宿主进程可能扩大风险。不要允许不可信宿主用户并发操纵挂载源，也不要把宿主敏感文件 hardlink 到 workspace。
@@ -138,12 +174,13 @@ LocalExecutor 只适用于开发、调试或明确受信任环境。它仅设置
 
 Local 默认只继承少量基础变量（PATH、LANG、LC_ALL、TERM、HOME、TMPDIR），但这**不构成秘密隔离**：宿主文件、进程和用户权限仍可访问。
 
-必须显式 `-sandbox=local` 才能启用；启动时打印警告，Messaging Gateway / 旧飞书模式额外指出远程宿主执行风险。Local 无法强制只读，因此该模式的 Explorer 不注册 Bash，仅开放 `read_file`。不要把 Local + RO Policy 当作隔离环境。
+必须显式 `-sandbox=local` 才能启用；启动时打印警告，Messaging Gateway / 旧飞书模式额外指出远程宿主执行风险。Local 无法强制只读，因此该模式的 Explorer 不注册 Bash，仅开放 `read_file`。不要把 Local + RO Policy 当作隔离环境。显式 Local 是对普通 Coding 隔离策略的 UNSAFE opt-out，不是满足 RequiredCapabilities 的安全后端；RO、strict required resources 和 network allowlist 都会拒绝。
 
 ## 失败、取消与清理
 
 - Executor 中普通非零命令退出返回结构化 ExitCode；启动/daemon/工作目录/取消等错误返回 InfrastructureError，保留部分输出和 `errors.Is` 语义。
 - BashTool 对基础设施错误、超时、取消、非零退出均返回错误；Registry 保留 stdout/stderr 与退出状态，设置 `ToolResult.IsError=true`，用于 Recovery、Reminder 和下一轮 Observation。
+- Native 执行失败从不切换后端或重放命令；私有 runtime 清理失败也返回错误。启动能力探测不执行模型命令。普通非零命令通过私有 completion marker 区分 SRT 未完成启动；marker 仅用于错误分类，不是安全边界。其普通文件 inode 在启动前 exclusive create 并持有 FD，退出后只从该 FD 有界读取，绝不重新打开不可信进程可替换成 symlink/device/FIFO 的路径。
 - Unix Local 使用独立进程组，在取消时 SIGKILL 进程组，正常结束也尽可能清理子进程；主动 setsid/逃离进程组的宿主子进程不能保证清理。非 Unix 平台目前只能保证直接进程终止。
 - Docker 每次创建带随机名称和 `go-tiny-claw.sandbox=true` label 的容器，不复用持久会话。取消时杀 CLI 后，使用独立的、最多 5s 的 Context 执行 `docker rm --force`，并短暂重试容器创建竞态。
 - daemon 不可用或强制删除失败会返回错误，包含容器名称。主进程遭 SIGKILL、崩溃或宿主掉电时清理代码可能无法执行；请检查遗留容器，不要假定 `--rm` 在这些情况下自动停止正在运行的容器。
@@ -167,12 +204,15 @@ Prompt、AGENTS.md、SYSTEM.md、APPEND_SYSTEM.md 和 Skills 同样不是安全�
 docker build -f Dockerfile.sandbox -t go-tiny-claw-sandbox:latest .
 go test ./...
 go vet ./...
-go test -count=1 -v ./internal/executor -run DockerIntegration
-go test -count=1 -v ./cmd/claw -run DockerSessionFactoryIntegration
+go test -count=1 -v ./internal/executor -run 'SandboxContract|NativeIntegration|DockerIntegration|Backend|Network|NativeRuntime'
+go test -count=1 -v ./cmd/claw -run 'DockerSessionFactoryIntegration|NativeSessionFactoryIntegration'
+go run ./cmd/sandbox-bench
 ```
 
-integration tests 验证 workspace 可访问/Coding 可写/Explorer 不可写、RootFS 只读、无外部路由与连接、宿主文件和凭证不可见，以及取消/超时后无新增遗留容器。网络测试使用 TEST-NET 地址，不依赖公网服务。Engine 测试使用 fake Provider + 真实 Docker，验证所有现有工具与失败 Recovery，不调用模型。
+Docker / Native 共用 backend-agnostic contract：workspace RW/RO、parent/sibling 宿主写入不逃逸、fixture HOME/CLAW_HOME/SSH/AWS/Kube 与 symlink、allowlisted/unknown/secret env、HOME/TMPDIR、stdout/stderr/exit/streaming、timeout/cancel/child、空格/逗号/引号/Unicode 路径。凭据测试只创建私密临时 fixture，不读取开发机器真实秘密。Docker 独立验证 rootfs/cap drop/no-new-privileges、cgroup memory/swap/CPU/PID 与 container cleanup；Native 独立验证 SRT enforcement、runtime cleanup、loopback HTTP allowlist 和 noproxy/unset proxy/direct socket bypass。网络使用本地 HTTP fixture 与 TEST-NET，不依赖公网作为唯一证据。Engine 使用 fake Provider + 真实后端，不调用真实模型。
 
-daemon 或测试镜像不可用时 integration tests 可 Skip；**生产 auto 不允许安全降级**。可以通过 `CLAW_SANDBOX_TEST_IMAGE` 选择可信测试镜像。真实模型与飞书 / Telegram 消息链路需另行验证。
+daemon/测试镜像缺失或未安装 srt 时 integration tests 明确 Skip；已安装的 SRT 无法通过 enforcement probe 时测试 FAIL，不把安全失败伪装成 Skip。**Skip 不等于 Pass，生产 auto 不允许降级到 Local**。可通过 `CLAW_SANDBOX_TEST_IMAGE` 选择可信测试镜像。本次 macOS 的真实 Native / Docker 测试、CLI smoke 与 benchmark 均已运行：全仓 uncached tests 为 711 个通过项（含子测试）、1 个原有交互式 OAuth SKIP、0 FAIL；两包 race 检查通过。Native 测试没有因缺依赖跳过。Linux amd64 交叉编译通过，但 Linux/bubblewrap 未实测，CI 工作流已准备但尚未执行。Windows Native 明确拒绝（现有 Session Store 也未正式支持 Windows），不能因 SRT 上游支持 Windows 就声称本项目已验证。真实模型与消息链路需另行验证。
 
-本阶段不实现 Kubernetes、gVisor、Firecracker、VM、bwrap、macOS sandbox-exec、网络白名单/credential proxy、SSH/远程 Executor 或长生命周期容器。现有 Executor 接口保留 streaming/cancel 扩展点，后续 Session Sandbox 不要求修改 AgentEngine。
+无需 Provider 的人工验收见 [sandbox-verification.md](sandbox-verification.md)，测量方法与结果见 [sandbox-benchmark.md](sandbox-benchmark.md)。
+
+本项目不自行实现 Kubernetes、gVisor、Firecracker、VM、bubblewrap/Seatbelt engine、HTTP/SOCKS/credential proxy、Windows WFP、cgroup controller、SSH/远程 Executor 或长生命周期容器。Native OS 与网络机制全部委托 SRT；Docker 不删除也不弱化。现有 Executor 接口保留 streaming/cancel 扩展点，后续 Session Sandbox 不要求修改 AgentEngine。

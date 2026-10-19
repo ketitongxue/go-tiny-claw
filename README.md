@@ -22,7 +22,7 @@
 | Tool Calling / 并发 Tool | ✅ |
 | read / write / edit / bash | ✅ |
 | Explorer Subagent | ✅ |
-| Docker Sandbox | ✅ |
+| Native（Anthropic SRT）/ Docker Sandbox | ✅（macOS 实机验证通过） |
 | Main / Explorer 独立 Sandbox Policy | ✅ |
 | Durable Session / Resume | ✅ |
 | Token-aware Context | ✅ |
@@ -79,9 +79,10 @@
        read     write  edit   bash    subagent
                               │          │
                            Executor   Explorer
-                         ┌────┴────┐
-                         │         │
-                      Docker     Local
+                    ┌─────────┼─────────┐
+                    │         │         │
+                  Native    Docker    Local
+                   SRT      strict    UNSAFE
 ```
 
 一个 Conversation 对应一个独立 Session。同一 Conversation 串行执行，不同 Conversation 可以并行；不同 Channel / Account / Chat 的 Session 互相隔离。
@@ -94,7 +95,7 @@
 
 - macOS / Linux
 - Go 1.26.2
-- Docker / Docker Desktop
+- Anthropic SRT（Native），或 Docker / Docker Desktop（严格资源后端）
 - Git
 - 对应模型 Provider 的凭据
 - 按启用的通道准备飞书应用凭据 / Telegram Bot Token
@@ -103,6 +104,8 @@
 
 ```bash
 go version
+srt --version    # Native
+# 或严格资源后端：
 docker version
 ```
 
@@ -122,9 +125,18 @@ go install ./cmd/claw
 
 ---
 
-## 2. 构建 Sandbox
+## 2. 安装 / 构建 Sandbox
 
-推荐使用 Docker Sandbox：
+日常本地 Coding 默认 `-sandbox=auto`，按应用 Policy 和 backend capability 优先选择 OS-native Sandbox：
+
+```bash
+npm install -g @anthropic-ai/sandbox-runtime
+srt --version
+```
+
+SRT 在 macOS 使用 Seatbelt / sandbox-exec，Linux 使用 bubblewrap（另需系统安装 bubblewrap、socat、ripgrep 等 SRT 依赖）。程序不自动安装，缺少依赖或无法验证隔离时不会运行 Native。Windows Native 未验证，本项目目前明确拒绝。
+
+Docker 仍完整保留，用于必须强制 CPU / Memory / PID 限制的场景；也可在 Native 不可用、且策略兼容时由 auto 选择：
 
 ```bash
 docker build \
@@ -133,9 +145,9 @@ docker build \
   .
 ```
 
-默认 Bash 不访问宿主机，而是在一次性 Docker Container 中执行。
+两种安全后端均限制 Bash 的文件和网络访问；Native 使用每命令独立的临时 HOME/TMPDIR，默认保护真实 HOME、`~/.claw`、SSH/AWS/Kube 和 sibling projects，不继承凭据环境变量。Native 不提供 CPU/Memory/PID 强制上限。
 
-主要限制包括：
+Docker 额外保持以下限制：
 
 ```text
 Network:      OFF
@@ -429,7 +441,7 @@ spawn_subagent
 Explorer：
 
 ```text
-Docker:
+Native / Docker:
   read_file
   bash (ReadOnly Workspace)
 
@@ -446,35 +458,47 @@ Local:
 
 ---
 
-# Sandbox
+# Sandbox Modes
 
-推荐：
-
-```bash
--sandbox docker
-```
-
-或默认：
-
-```bash
--sandbox auto
-```
-
-不会自动降级到 LocalExecutor。
-
-如果明确使用：
+| 模式 | 行为 |
+| --- | --- |
+| `auto`（默认） | 根据 Policy / Capabilities：Native 优先，再检查 Docker；没有满足者则 fail closed；永不选择 Local |
+| `native` | Anthropic SRT / OS-native 文件与网络隔离；资源 best-effort（CPU/Memory/PID 不强制） |
+| `docker` | 一次性 Container、RO rootfs、cap drop、no-new-privileges、网络与 CPU/Memory/PID 强制限制 |
+| `local` | **UNSAFE**：显式宿主当前用户执行，能读取凭据、联网和修改 workspace 外文件，仅限可信代码调试 |
 
 ```bash
--sandbox local
+# 日常 Coding：普通策略允许 Native
+claw -mode demo -sandbox=auto -workdir ./workspace -prompt '分析代码'
+
+# 严格资源：auto 只能路由 Docker
+claw -mode demo -sandbox=auto -sandbox-policy=strict -workdir ./workspace -prompt '运行测试'
+
+# Native 受控网络（应用配置，不是模型 Bash 参数）
+claw -mode demo -sandbox=native -sandbox-network=allowlist \
+  -sandbox-allowed-domains='github.com,*.githubusercontent.com,proxy.golang.org,sum.golang.org' \
+  -workdir ./workspace -prompt '检查项目依赖'
 ```
 
-Bash 将直接以当前操作系统用户权限运行。
+网络默认 denied；allowlist 必须非空。Docker 暂不支持域名 allowlist，会拒绝该策略；Native 不支持 unrestricted 网络语义，也会拒绝。strict resources + domain allowlist 目前没有同时满足的后端，必须报错。启动打印实际 backend、filesystem、network 与资源 enforcement 状态。
 
-> 不建议将 `Messaging Gateway + LocalExecutor` 用于无人值守远程执行。
+**选择只发生在构建 Executor 时。Native / Docker 执行失败从不跨后端重试，不会重放已可能产生副作用的命令，也不会自动降级 Local。** 显式 native + strict 必须失败。Explorer 使用单独 RO executor；Local 下不注册 Explorer Bash。
 
-详细安全说明见：
+无需模型或凭据即可直接验收：
 
-[docs/security.md](docs/security.md)
+```bash
+claw sandbox -sandbox=auto -workdir . -command 'pwd; ls; git status'
+claw sandbox -sandbox=auto -policy=strict -workdir . -command 'echo strict-docker'
+claw sandbox -sandbox=native -policy=explorer -workdir . -command 'echo forbidden > new-file' # 必须失败
+```
+
+Native 是严格 allow-read 模型，HOME 下的 module cache/nvm/pyenv 等不会自动开放；使用系统工具链、workspace vendoring/cache 或 Docker。Docker 保留 `/tmp` noexec，Go 测试二进制使用 RW workspace 的 GOTMPDIR；不会为兼容而放松 tmpfs。
+
+> Project Trust ≠ Sandbox；Prompt Instructions ≠ Security Boundary；Human Approval ≠ OS Sandbox。不要将 Messaging Gateway + Local 用于无人值守远程执行。
+
+安全说明：[docs/security.md](docs/security.md) · 完整验收：[docs/sandbox-verification.md](docs/sandbox-verification.md) · 性能：[docs/sandbox-benchmark.md](docs/sandbox-benchmark.md)。
+
+本次 macOS 已安装并实测 SRT 0.0.80：Native / Docker contract、安全、网络、取消与清理回归均通过，auto 普通策略实际选择 Native，strict 实际选择 Docker；Native / Docker benchmark 均已采样。Linux CI 已准备但未实际执行，Windows Native 不支持。不要把缺依赖的 SKIP 当作 PASS。
 
 ---
 

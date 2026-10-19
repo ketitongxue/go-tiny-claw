@@ -17,7 +17,7 @@ import (
 
 func main() {
 	model := flag.String("model", "", "模型 provider/model；默认读取全局 config.json")
-	sandbox := flag.String("sandbox", executor.ModeAuto, "执行后端：auto、docker、local（不安全）")
+	sandbox := flag.String("sandbox", executor.ModeAuto, "执行后端：auto、native、docker、local（不安全）")
 	image := flag.String("sandbox-image", executor.DefaultImage, "预先构建的 Sandbox 镜像")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -51,7 +51,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	exec, err := executor.NewConfigured(ctx, *sandbox, *image, executor.CodingPolicy())
+	if err := os.MkdirAll("workspace", 0o755); err != nil {
+		log.Fatal(err)
+	}
+	exec, err := executor.NewConfigured(ctx, *sandbox, *image, "workspace", executor.CodingPolicy())
 	if err != nil {
 		log.Fatal(err)
 	}

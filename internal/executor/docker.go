@@ -7,10 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -34,7 +32,10 @@ func NewDockerExecutor(image string, policy SandboxPolicy) (*DockerExecutor, err
 	if err := policy.Validate(); err != nil {
 		return nil, err
 	}
-	policy.AllowedEnv = append([]string(nil), policy.AllowedEnv...)
+	if err := requireCapabilities(ModeDocker, DockerCapabilities(), policy); err != nil {
+		return nil, err
+	}
+	policy = policy.clone()
 	var random [12]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return nil, &InfrastructureError{Op: "executor identifier", Err: err}
@@ -64,6 +65,20 @@ func dockerAvailable(ctx context.Context, binary string) error {
 	result, err := runProcess(ctx, exec.CommandContext(ctx, binary, "version", "--format", "{{.Server.Version}}"), nil)
 	if err != nil || result.ExitCode != 0 || strings.TrimSpace(result.Stdout) == "" {
 		return &InfrastructureError{Op: "docker version", Err: errors.Join(ErrDockerUnavailable, err, fmt.Errorf("exit=%d: %s", result.ExitCode, strings.TrimSpace(result.Stderr)))}
+	}
+	return nil
+}
+
+// CheckResourceSupport refuses daemons which would merely warn and ignore
+// resource flags (notably rootless / cgroup-less hosts). Flags alone are not
+// proof of enforcement. Check before execution, never after partial effects.
+func (e *DockerExecutor) CheckResourceSupport(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	format := "{{.MemoryLimit}} {{.SwapLimit}} {{.CPUCfsQuota}} {{.CPUCfsPeriod}} {{.PidsLimit}}"
+	r, err := runProcess(ctx, exec.CommandContext(ctx, e.dockerBinary, "info", "--format", format), nil)
+	if err != nil || r.ExitCode != 0 || strings.TrimSpace(r.Stdout) != "true true true true true" {
+		return &InfrastructureError{Op: "Docker resource capability check", Err: errors.Join(ErrUnsupportedPolicy, err, fmt.Errorf("daemon cannot demonstrate memory/swap/cpu/pids enforcement"))}
 	}
 	return nil
 }
@@ -107,6 +122,9 @@ func (e *DockerExecutor) Execute(ctx context.Context, req Request, onOutput Outp
 		return result, &InfrastructureError{Op: "docker execution parameters", Err: err}
 	}
 
+	if err := e.CheckResourceSupport(ctx); err != nil {
+		return result, err
+	}
 	var random [12]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return result, &InfrastructureError{Op: "container name", Err: err}
@@ -178,11 +196,14 @@ func buildDockerArgsContext(ctx context.Context, req Request, policy SandboxPoli
 	if _, err := policy.executionTimeout(req.Timeout); err != nil {
 		return nil, err
 	}
+	if err := requireCapabilities(ModeDocker, DockerCapabilities(), policy); err != nil {
+		return nil, err
+	}
 	workDir, err := canonicalWorkDir(req.WorkDir)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateDockerWorkDir(ctx, workDir); err != nil {
+	if err := validateSandboxWorkDir(ctx, workDir); err != nil {
 		return nil, err
 	}
 	env, err := policy.environment(req.Env)
@@ -227,65 +248,20 @@ func buildDockerArgsContext(ctx context.Context, req Request, policy SandboxPoli
 	for _, entry := range env {
 		args = append(args, "--env", entry)
 	}
+	// Do not depend on a custom image's HOME/TMPDIR defaults.
+	defaults := []string{"HOME=/tmp", "TMPDIR=/tmp",
+		// Docker Desktop may present a different bind-mount owner UID. Trust
+		// only this mount for git, not every repository on the filesystem.
+		"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory", "GIT_CONFIG_VALUE_0=/workspace",
+		// Keep /tmp's existing noexec hardening. Go test executables must
+		// live in the already executable RW workspace, not weaken tmpfs.
+		"GOTMPDIR=/workspace"}
+	for _, entry := range defaults {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, supplied := req.Env[key]; !supplied {
+			args = append(args, "--env", entry)
+		}
+	}
+	// HOME/TMPDIR cannot be supplied: policy validation reserves those keys.
 	return args, nil
-}
-
-func validateDockerWorkDir(ctx context.Context, workDir string) error {
-	if workDir == string(filepath.Separator) || strings.ContainsAny(workDir, "\r\n\x00") {
-		return fmt.Errorf("%w: unsafe Docker workspace %q", ErrInvalidWorkDir, workDir)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("%w: cannot determine host home: %w", ErrInvalidWorkDir, err)
-	}
-	home = canonicalPotentialPath(home)
-	if pathContains(workDir, home) {
-		return fmt.Errorf("%w: mounting the host home or its ancestor is forbidden", ErrInvalidWorkDir)
-	}
-	for _, protected := range []string{
-		filepath.Join(home, ".ssh"), filepath.Join(home, ".aws"), filepath.Join(home, ".config"),
-		"/var/run/docker.sock", "/run/docker.sock",
-	} {
-		protected = canonicalPotentialPath(protected)
-		if pathContains(workDir, protected) || pathContains(protected, workDir) {
-			return fmt.Errorf("%w: workspace overlaps protected host path %s", ErrInvalidWorkDir, protected)
-		}
-	}
-	// A socket/device physically located inside a bind mount remains a host
-	// capability, even with network=none. Never expose it to a container.
-	return filepath.WalkDir(workDir, func(path string, entry fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			return fmt.Errorf("%w: inspect workspace: %w", ErrInvalidWorkDir, err)
-		}
-		if entry.Type()&(os.ModeSocket|os.ModeDevice) != 0 {
-			return fmt.Errorf("%w: workspace contains a host socket/device: %s", ErrInvalidWorkDir, path)
-		}
-		return nil
-	})
-}
-
-func pathContains(parent, child string) bool {
-	relative, err := filepath.Rel(parent, child)
-	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) && !filepath.IsAbs(relative)
-}
-
-// Resolve an existing ancestor when a protected leaf (e.g. docker.sock) does not
-// exist, so /var -> /private/var symlinks cannot bypass the overlap check.
-func canonicalPotentialPath(path string) string {
-	absolute, err := filepath.Abs(path)
-	if err != nil {
-		return filepath.Clean(path)
-	}
-	for current := absolute; ; current = filepath.Dir(current) {
-		if resolved, err := filepath.EvalSymlinks(current); err == nil {
-			suffix, _ := filepath.Rel(current, absolute)
-			return filepath.Join(resolved, suffix)
-		}
-		if filepath.Dir(current) == current {
-			return absolute
-		}
-	}
 }

@@ -55,7 +55,7 @@ func TestStartupModesAndCredentialRequirements(t *testing.T) {
 }
 
 func TestSandboxCLIOptions(t *testing.T) {
-	for _, mode := range []string{executor.ModeAuto, executor.ModeDocker, executor.ModeLocal} {
+	for _, mode := range []string{executor.ModeAuto, executor.ModeNative, executor.ModeDocker, executor.ModeLocal} {
 		opts, err := parseOptions([]string{"-sandbox=" + mode, "-sandbox-image=custom-sandbox:v2"}, io.Discard)
 		if err != nil || opts.sandbox != mode || opts.sandboxImage != "custom-sandbox:v2" {
 			t.Fatalf("options=%+v error=%v", opts, err)
@@ -75,7 +75,11 @@ func TestSandboxCLIOptions(t *testing.T) {
 func installDockerStub(t *testing.T, script string) {
 	t.Helper()
 	binDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(binDir, "docker"), []byte("#!/bin/sh\nif [ \"$1\" = info ]; then echo true true true true true; exit; fi\n"+script+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Keep auto routing deterministic even on machines with a real SRT.
+	if err := os.WriteFile(filepath.Join(binDir, "srt"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -229,7 +233,10 @@ func runSessionFactoryRegression(t *testing.T, opts options, executors sessionEx
 				}
 				resp.ToolCalls = []schema.ToolCall{makeCall("bash", "sub-write", map[string]string{"command": "echo hacked > sample.txt"})}
 			case "sub-write":
-				if !strings.Contains(last.Content, "code 1") || !strings.Contains(last.Content, "Read-only file system") || !strings.Contains(last.Content, "[系统救援指南]") {
+				// OS runtimes use different diagnostics (Seatbelt: EPERM,
+				// bind mounts: EROFS). Check failure/recovery and unchanged
+				// content on the subsequent read, not Docker-specific wording.
+				if !strings.Contains(last.Content, "code 1") || !strings.Contains(last.Content, "[系统救援指南]") {
 					return nil, fmt.Errorf("Explorer did not reject writing: %q", last.Content)
 				}
 				resp.ToolCalls = []schema.ToolCall{makeCall("bash", "sub-bash", map[string]string{"command": "cat sample.txt"})}

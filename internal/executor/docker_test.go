@@ -174,12 +174,17 @@ func TestDockerArgsEnvironmentAndNetwork(t *testing.T) {
 	if err != nil || optionValue(args, "--network") != "bridge" {
 		t.Fatalf("explicit network policy=%v (%v)", args, err)
 	}
+	policy.AllowedEnv = append(policy.AllowedEnv, "GOTMPDIR")
+	args, err = buildDockerArgs(Request{WorkDir: req.WorkDir, Env: map[string]string{"GOTMPDIR": "/workspace/build-temp"}}, policy)
+	if err != nil || !containsArg(args, "GOTMPDIR=/workspace/build-temp") || strings.Count(strings.Join(args, "\n"), "GOTMPDIR=") != 1 {
+		t.Fatalf("allowlisted override lost: %v (%v)", args, err)
+	}
 }
 
 func fakeDocker(t *testing.T, policy SandboxPolicy, script string) *DockerExecutor {
 	t.Helper()
 	binary := filepath.Join(t.TempDir(), "fake-docker")
-	if err := os.WriteFile(binary, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nif [ \"$1\" = info ]; then echo true true true true true; exit; fi\n"+script+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	e, err := NewDockerExecutor(DefaultImage, policy)
@@ -302,7 +307,10 @@ esac`)
 			defer cancel()
 			req := Request{Command: "sleep 10", WorkDir: t.TempDir()}
 			if timeout {
-				req.Timeout = 500 * time.Millisecond
+				// Include workspace/resource preflight in the budget. A 500ms
+				// deadline can expire before the fake container starts on a
+				// loaded host, testing preflight rather than container cleanup.
+				req.Timeout = 2 * time.Second
 			}
 			result, err := e.Execute(ctx, req, func(p []byte) {
 				if !timeout && strings.Contains(string(p), "ready") {
@@ -313,7 +321,7 @@ esac`)
 			if timeout {
 				want = context.DeadlineExceeded
 			}
-			if !errors.Is(err, want) || result.Duration > 3*time.Second || !strings.Contains(result.Stdout, "ready") {
+			if !errors.Is(err, want) || result.Duration > 5*time.Second || !strings.Contains(result.Stdout, "ready") {
 				t.Fatalf("result=%+v error=%v", result, err)
 			}
 			if _, err := os.Stat(state); !os.IsNotExist(err) {

@@ -90,14 +90,14 @@ func trustCommand(ctx context.Context, args []string, paths config.Paths, cio co
 
 func promptCommand(ctx context.Context, args []string, paths config.Paths, cio commandIO) error {
 	if len(args) == 0 || (args[0] != "show" && args[0] != "render") {
-		return errors.New("usage: claw prompt show|render [-workdir <path>] [-agent main|explorer] [-sandbox auto|docker|local] [-plan]")
+		return errors.New("usage: claw prompt show|render [-workdir <path>] [-agent main|explorer] [-sandbox auto|native|docker|local] [-plan]")
 	}
 	action := args[0]
 	fs := flag.NewFlagSet("prompt "+action, flag.ContinueOnError)
 	fs.SetOutput(cio.output)
 	workDir := fs.String("workdir", ".", "workspace (default: current directory)")
 	agent := fs.String("agent", "main", "main or explorer")
-	sandbox := fs.String("sandbox", executor.ModeAuto, "tool selection only; does not connect to Docker")
+	sandbox := fs.String("sandbox", executor.ModeAuto, "tool selection only; does not probe any sandbox")
 	plan := fs.Bool("plan", false, "include plan workflow for Main")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
