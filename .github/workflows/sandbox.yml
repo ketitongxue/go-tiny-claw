@@ -37,14 +37,21 @@ jobs:
           # Reviewed schema fixture, NOT a claimed minimum supported version.
           npm install -g @anthropic-ai/sandbox-runtime@0.0.80
           # Native intentionally does not open arbitrary HOME/toolcache trees.
-          # Expose only this trusted Go SDK and Node through system locations.
-          go_root="$(go env GOROOT)"
+          # A symlink is not enough: denyRead '/' hides its lookup path, and
+          # Linux's mount namespace does not recreate that alias. Copy ONLY
+          # this trusted SDK into the existing system-toolchain allowlist.
+          go_root="$(cd "$(go env GOROOT)" && pwd -P)"
           if [[ "$go_root" != /usr/local/go ]]; then
             if [[ -e /usr/local/go || -L /usr/local/go ]]; then
               sudo mv /usr/local/go /usr/local/go.before-sandbox-tests
             fi
-            sudo ln -s "$go_root" /usr/local/go
+            sudo mkdir -p /usr/local
+            sudo cp -R "$go_root" /usr/local/go
           fi
+          test ! -L /usr/local/go
+          /usr/local/go/bin/go version
+          # Node runs the trusted SRT outside the sandbox; its link need not
+          # be visible to sandboxed workloads.
           node_binary="$(command -v node)"
           sudo ln -sf "$node_binary" /usr/local/bin/node
           if [[ "$RUNNER_OS" == Linux ]]; then
@@ -53,6 +60,8 @@ jobs:
             sudo ln -sf "$node_binary" /usr/bin/node
           fi
           srt --version
+      - name: Verify Go and Git inside the Native sandbox
+        run: go test -count=1 -v ./internal/executor -run '^TestNativeIntegrationToolchain$'
       - name: Native contracts and security regressions (no skip on enforcement failure)
         run: |
           go test -count=1 -v ./internal/executor -run '^TestSandboxContract/Native$'

@@ -498,7 +498,7 @@ Native 是严格 allow-read 模型，HOME 下的 module cache/nvm/pyenv 等不�
 
 安全说明：[docs/security.md](docs/security.md) · 完整验收：[docs/sandbox-verification.md](docs/sandbox-verification.md) · 性能：[docs/sandbox-benchmark.md](docs/sandbox-benchmark.md)。
 
-本次 macOS 已安装并实测 SRT 0.0.80：Native / Docker contract、安全、网络、取消与清理回归均通过，auto 普通策略实际选择 Native，strict 实际选择 Docker；Native / Docker benchmark 均已采样。Linux CI 已准备但未实际执行，Windows Native 不支持。不要把缺依赖的 SKIP 当作 PASS。
+本次 macOS 已安装并实测 SRT 0.0.80：Native / Docker contract、安全、网络、取消与清理回归均通过，auto 普通策略实际选择 Native，strict 实际选择 Docker；Native / Docker benchmark 均已采样。Linux / macOS Native 与 Docker 的跨平台验证结果以 [GitHub Actions](https://github.com/ketitongxue/go-tiny-claw/actions/workflows/sandbox.yml) 为准；Windows Native 不支持。不要把缺依赖的 SKIP 当作 PASS。
 
 ---
 

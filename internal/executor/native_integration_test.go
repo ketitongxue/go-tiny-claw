@@ -28,9 +28,9 @@ func TestNativeIntegrationToolchain(t *testing.T) {
 	if out, err := exec.Command("git", "init", "--quiet", "--template=", work).CombinedOutput(); err != nil {
 		t.Fatalf("git fixture: %v (%s)", err, out)
 	}
-	r, err := e.Execute(context.Background(), Request{WorkDir: work, Command: `pwd && ls && git status --porcelain && go test ./... && printf created > note && printf changed > note && test "$(cat note)" = changed`}, nil)
+	r, err := e.Execute(context.Background(), Request{WorkDir: work, Command: `command -v go && go version && go env GOROOT && pwd && ls && git status --porcelain && go test ./... && printf created > note && printf changed > note && test "$(cat note)" = changed`}, nil)
 	if err != nil || r.ExitCode != 0 {
-		t.Fatalf("native system toolchain: %+v (%v)", r, err)
+		t.Fatalf("native system toolchain (install a real Go SDK at /usr/local/go, not a hidden toolcache symlink): %+v (%v)", r, err)
 	}
 }
 

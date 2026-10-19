@@ -42,7 +42,7 @@ claw sandbox -sandbox=docker -workdir "$ws" -command 'pwd; ls; git status; go te
 claw sandbox -sandbox=local -workdir "$ws" -command 'echo trusted-local-debug'
 ```
 
-系统 Go 需位于允许的 `/usr/local/go`；Native 不读取 HOME 下 module/build cache。上面的模块无第三方依赖。真实项目可能需要 workspace vendoring 或显式 proxy.golang.org/sum.golang.org allowlist；需要监听端口、嵌套 sandbox、宿主 API 的测试不一定适合 Native 的默认限制，不应因此放宽 HOME 或开启 weaker sandbox。
+系统 Go 需安装到允许的 `/usr/local/go` 真实目录；不要仅创建指向未开放 HOME/toolcache 的符号链接。CI 只复制选中的 Go SDK，并在 contract 前单独验证沙箱内的 `command -v go`、版本、GOROOT、Git 和小型 Go 测试；不会扩大文件读白名单。Native 不读取 HOME 下 module/build cache。上面的模块无第三方依赖。真实项目可能需要 workspace vendoring 或显式 proxy.golang.org/sum.golang.org allowlist；需要监听端口、嵌套 sandbox、宿主 API 的测试不一定适合 Native 的默认限制，不应因此放宽 HOME 或开启 weaker sandbox。
 
 如果已经配置模型，可额外启动完整 Agent（需要现有 Provider 凭据，下面不设置/打印任何 token）：
 
@@ -146,6 +146,6 @@ go run ./cmd/sandbox-bench
 
 本次 macOS 使用 SRT 0.0.80 / Node 26.8.2，已实际通过 Native / Docker 全部 contract、Native 工具链、HOME/凭据与 symlink、网络 proxy/bypass、timeout/cancel/child、cleanup，以及 CLI native/auto/docker/local/strict smoke。全仓 uncached tests：711 PASS（含子测试）、1 个原有交互式 OAuth SKIP、0 FAIL；executor 与 claw race 检查通过。
 
-SKIP 必须记录原因：缺 srt、Docker daemon/image 或不支持的 OS。已安装 SRT 但安全探测失败是 FAIL，不是 SKIP。Native/bubblewrap CI 见 `.github/workflows/sandbox.yml`；Linux 仅完成交叉编译，尚未在本次开发会话执行 bubblewrap/CI。Windows Native 明确不可用，不声称验证。
+SKIP 必须记录原因：缺 srt、Docker daemon/image 或不支持的 OS。已安装 SRT 但安全探测失败是 FAIL，不是 SKIP。Native/bubblewrap CI 见 `.github/workflows/sandbox.yml`，Linux/macOS 的实际结果以 [GitHub Actions](https://github.com/ketitongxue/go-tiny-claw/actions/workflows/sandbox.yml) 对应提交为准，不能用本地通过或交叉编译成功代替。Windows Native 明确不可用，不声称验证。
 
 验收后自行删除本次 fixture：`rm -rf "$ws"`（先确认变量确实指向本次临时目录）。

@@ -119,7 +119,7 @@ srt --version
 
 启动不只 LookPath：**首次执行任何 SRT 代码之前（包括 `--version`）**，构造函数必须取得启动 workspace，canonicalize workspace 与 SRT 可执行文件，拒绝 workspace 与可执行文件/npm 包安装目录重叠（包括符号链接别名），并检查包名及安装目录不与凭据路径重叠。路径检查失败时不会运行版本或隔离探测；auto 只可在构建期另选符合策略的 Docker。随后，5s `--version` 必须正常报告版本，再运行有界、本地 fixture 隔离探测，验证显式 missing/empty/invalid settings 必须拒绝（不准 SRT fallback 默认配置）、literal-path schema、workspace RW、读取禁止、RO、网络默认 deny、allowlist、direct TCP 与 Unix socket 阻断。缺少必要 curl/Node/SRT/OS 依赖、旧 SRT 忽略配置或 seccomp 不可用而放行 socket，均不能通过探测。源格式依据上游 npm 0.0.80 审查，并已在 macOS / Node 26.8.2 上安装 SRT 0.0.80，通过真实 contract、工具链、网络、凭据、取消与清理测试。0.0.80 是已实测基线，**不是未经比较就宣称的最低版本**；不捏造 minimum semver。以版本报告 + 实际 enforcement probes fail closed；升级 SRT 后必须重跑真实 integration tests。
 
-系统安装的 Go（`/usr/local/go`）、OS git/bash/curl 与明确列出的 SDK 路径可用；HOME 下的 nvm/pyenv、用户 module cache、任意 Homebrew SDK 不会自动重新开放。使用系统工具链、workspace vendoring/cache 或 Docker，不得用开放 HOME 来“修复”。SRT 自身的 Node/rg/bwrap/socat 也必须能在受控系统 PATH 找到。
+系统安装的 Go（`/usr/local/go`）、OS git/bash/curl 与明确列出的 SDK 路径可用。CI 将 setup-go 选中的 SDK **复制为 `/usr/local/go` 的真实目录**，而非仅创建指向 hostedtoolcache 的符号链接：严格读白名单/namespace 不保证未开放的别名路径可用。CI 在 contract 前独立运行沙箱内 Go/Git 工具链检查，不因此开放整个 HOME/toolcache。HOME 下的 nvm/pyenv、用户 module cache、任意 Homebrew SDK 不会自动重新开放。使用系统工具链、workspace vendoring/cache 或 Docker，不得用开放 HOME 来“修复”。SRT 自身的 Node/rg/bwrap/socat 也必须能在受控系统 PATH 找到。
 
 ## 网络语义与应用配置
 
@@ -211,7 +211,7 @@ go run ./cmd/sandbox-bench
 
 Docker / Native 共用 backend-agnostic contract：workspace RW/RO、parent/sibling 宿主写入不逃逸、fixture HOME/CLAW_HOME/SSH/AWS/Kube 与 symlink、allowlisted/unknown/secret env、HOME/TMPDIR、stdout/stderr/exit/streaming、timeout/cancel/child、空格/逗号/引号/Unicode 路径。凭据测试只创建私密临时 fixture，不读取开发机器真实秘密。Docker 独立验证 rootfs/cap drop/no-new-privileges、cgroup memory/swap/CPU/PID 与 container cleanup；Native 独立验证 SRT enforcement、runtime cleanup、loopback HTTP allowlist 和 noproxy/unset proxy/direct socket bypass。网络使用本地 HTTP fixture 与 TEST-NET，不依赖公网作为唯一证据。Engine 使用 fake Provider + 真实后端，不调用真实模型。
 
-daemon/测试镜像缺失或未安装 srt 时 integration tests 明确 Skip；已安装的 SRT 无法通过 enforcement probe 时测试 FAIL，不把安全失败伪装成 Skip。**Skip 不等于 Pass，生产 auto 不允许降级到 Local**。可通过 `CLAW_SANDBOX_TEST_IMAGE` 选择可信测试镜像。本次 macOS 的真实 Native / Docker 测试、CLI smoke 与 benchmark 均已运行：全仓 uncached tests 为 711 个通过项（含子测试）、1 个原有交互式 OAuth SKIP、0 FAIL；两包 race 检查通过。Native 测试没有因缺依赖跳过。Linux amd64 交叉编译通过，但 Linux/bubblewrap 未实测，CI 工作流已准备但尚未执行。Windows Native 明确拒绝（现有 Session Store 也未正式支持 Windows），不能因 SRT 上游支持 Windows 就声称本项目已验证。真实模型与消息链路需另行验证。
+daemon/测试镜像缺失或未安装 srt 时 integration tests 明确 Skip；已安装的 SRT 无法通过 enforcement probe 时测试 FAIL，不把安全失败伪装成 Skip。**Skip 不等于 Pass，生产 auto 不允许降级到 Local**。可通过 `CLAW_SANDBOX_TEST_IMAGE` 选择可信测试镜像。本次 macOS 的真实 Native / Docker 测试、CLI smoke 与 benchmark 均已运行：全仓 uncached tests 为 711 个通过项（含子测试）、1 个原有交互式 OAuth SKIP、0 FAIL；两包 race 检查通过。Native 测试没有因缺依赖跳过。Linux amd64 交叉编译通过；Linux/bubblewrap 与 macOS 的跨平台验证结果以 [Sandbox contracts CI](https://github.com/ketitongxue/go-tiny-claw/actions/workflows/sandbox.yml) 对应提交的实际结果为准。Windows Native 明确拒绝（现有 Session Store 也未正式支持 Windows），不能因 SRT 上游支持 Windows 就声称本项目已验证。真实模型与消息链路需另行验证。
 
 无需 Provider 的人工验收见 [sandbox-verification.md](sandbox-verification.md)，测量方法与结果见 [sandbox-benchmark.md](sandbox-benchmark.md)。
 
