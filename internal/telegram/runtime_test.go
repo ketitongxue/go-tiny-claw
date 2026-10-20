@@ -175,9 +175,12 @@ func TestTelegramDedupAcrossChatsAndGroupAdmission(t *testing.T) {
 	if out := await(t, api.sent); out.ChatID != "-42" || out.Text != "continued" {
 		t.Fatal("reply-to-bot was not admitted", out)
 	}
+	if g.ConversationCount() != 2 {
+		t.Fatal("group admission/session isolation changed", g.ConversationCount())
+	}
 	g.stop(t)
-	if runs.Load() != 3 || g.ConversationCount() != 2 {
-		t.Fatal("duplicate ran or group admission/session isolation changed", runs.Load(), g.ConversationCount())
+	if runs.Load() != 3 || g.ConversationCount() != 0 {
+		t.Fatal("duplicate ran or shutdown retained closed runtime", runs.Load(), g.ConversationCount())
 	}
 }
 
@@ -249,9 +252,12 @@ func TestTelegramDurableResumeAndCrossChannelSessionIsolation(t *testing.T) {
 		if out := await(t, feishu.sent); out.Text != "FEISHU-111" || out.ChatID != "42" {
 			t.Fatal("Feishu lost/mixed memory", out)
 		}
-		g.stop(t)
 		if g.ConversationCount() != 2 {
 			t.Fatal("cross-channel conversations merged")
+		}
+		g.stop(t)
+		if g.ConversationCount() != 0 {
+			t.Fatal("shutdown retained closed runtime")
 		}
 		tr := channel.Route{Channel: "telegram", AccountID: "default", ChatID: "42"}
 		for _, route := range []channel.Route{tr, fr} {

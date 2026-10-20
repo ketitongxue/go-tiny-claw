@@ -292,9 +292,19 @@ func TestQueueFullIsRetryableNotRemembered(t *testing.T) {
 			t.Fatal("missing queued task accepted notification", out)
 		}
 	}
+	c := conversationFor(t, g, inbound("a", "", "").Route)
+	g.conversations.mu.Lock()
+	seq := c.activitySeq
+	g.conversations.mu.Unlock()
 	overflow := inbound("a", "overflow", "retry")
 	if err := g.Receive(context.Background(), overflow); !errors.Is(err, ErrQueueFull) {
 		t.Fatal("missing backpressure", err)
+	}
+	g.conversations.mu.Lock()
+	unchanged := c.activitySeq == seq && seq == ConversationQueueSize+1
+	g.conversations.mu.Unlock()
+	if !unchanged {
+		t.Fatal("queue-full admission advanced activity")
 	}
 	assertNoDelivery(t, a)
 	close(release)

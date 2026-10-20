@@ -241,6 +241,10 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	if err != nil {
 		return err
 	}
+	idleTimeout, err := runtime.Config.Messaging.IdleTimeout()
+	if err != nil {
+		return err
+	}
 	enabledChannels, err := channelsForMode(opts.mode, runtime.Config.Channels)
 	if err != nil {
 		return err
@@ -297,6 +301,13 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	}
 	if opts.checkConfig {
 		fmt.Fprintf(output, "本地配置检查通过：mode=%s workspace=%s sandbox=%s sandbox-image=%s\nProvider: %s\nModel: %s\nAuth: %s\nCredential: available (%s)\nConfig: %s\n", opts.mode, opts.workDir, opts.sandbox, opts.sandboxImage, ref.ProviderID, ref.ModelID, credentialInfo.Type, credentialInfo.Source, runtime.Paths.Config)
+		if opts.mode != "demo" {
+			fmt.Fprintf(output, "Conversation idle timeout: %s", idleTimeout)
+			if idleTimeout == 0 {
+				fmt.Fprint(output, " (disabled)")
+			}
+			fmt.Fprintln(output)
+		}
 		if credentialInfo.RefreshBlocked {
 			fmt.Fprintln(output, "OAuth refresh deferred until earliest_refresh_at（本检查未联网）。")
 		} else if credentialInfo.NeedsRefresh {
@@ -356,7 +367,8 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 				return service.Create(callCtx, id, opts.workDir, selected, string(info.Type))
 			}}
 		gw, err := gateway.New(ctx, gateway.Config{Channels: channels, ResolveSession: sessions.Resolve,
-			Factory: factory, Approvals: approval.NewApprovalManager(), ReportingPolicy: reportingPolicy})
+			Factory: factory, Approvals: approval.NewApprovalManager(), ReportingPolicy: reportingPolicy,
+			ConversationIdleTimeout: idleTimeout})
 		if err != nil {
 			return err
 		}

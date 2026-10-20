@@ -2,8 +2,10 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"time"
 	"unicode"
 
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
@@ -15,7 +17,21 @@ import (
 const FallbackModel = "zai-coding-cn/glm-5.3"
 
 type MessagingConfig struct {
-	ReportMode string `json:"report_mode,omitempty"`
+	ReportMode              string `json:"report_mode,omitempty"`
+	ConversationIdleTimeout string `json:"conversation_idle_timeout,omitempty"`
+}
+
+// IdleTimeout parses user configuration before constructing the Gateway.
+// Empty means 30m; zero disables eviction. Runtime Config uses time.Duration.
+func (c MessagingConfig) IdleTimeout() (time.Duration, error) {
+	if c.ConversationIdleTimeout == "" {
+		return 30 * time.Minute, nil
+	}
+	d, err := time.ParseDuration(c.ConversationIdleTimeout)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("invalid messaging.conversation_idle_timeout %q: must be a non-negative duration (0 disables eviction)", c.ConversationIdleTimeout)
+	}
+	return d, nil
 }
 
 // ReportingPolicy is the configuration boundary: Gateway receives a typed
@@ -58,6 +74,9 @@ func Load(path string) (Config, error) {
 	if _, err := c.Messaging.ReportingPolicy(); err != nil {
 		return c, err
 	}
+	if _, err := c.Messaging.IdleTimeout(); err != nil {
+		return c, err
+	}
 	if c.Context.DefaultContextWindow < 0 || c.Context.DefaultReservedOutput < 0 || c.Context.MaxToolResultTokens < 0 || c.Context.SafetyMarginPercent < 0 || c.Context.SafetyMarginPercent >= 100 {
 		return c, errors.New("invalid context policy")
 	}
@@ -78,6 +97,9 @@ func Save(path string, c Config) error {
 		return err
 	}
 	if _, err := c.Messaging.ReportingPolicy(); err != nil {
+		return err
+	}
+	if _, err := c.Messaging.IdleTimeout(); err != nil {
 		return err
 	}
 	if _, err := provider.ParseModelRef(c.DefaultModel); err != nil {

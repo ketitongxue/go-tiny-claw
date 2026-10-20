@@ -245,7 +245,10 @@ claw session delete <session-id>
     "feishu": { "enabled": true },
     "telegram": { "enabled": true }
   },
-  "messaging": { "report_mode": "compact" }
+  "messaging": {
+    "report_mode": "compact",
+    "conversation_idle_timeout": "30m"
+  }
 }
 ```
 
@@ -262,7 +265,7 @@ claw gateway -workdir ./workspace
 可仅启用其中一个通道。未配置 / 未启用任何通道时，`claw gateway` 明确报错，不自动猜测。旧的 `claw -mode feishu` 暂时保留并打印弃用警告，始终只启动飞书；`claw -mode demo` 不变。
 
 - 两个平台同时在线，私聊直接对话；群聊 `@bot`，Telegram 也支持回复 bot 的消息。
-- 不同 Channel / Chat 独立 Durable Session，重启自动恢复，不跨平台绑定身份或共享历史。
+- 不同 Channel / Chat 独立 Durable Session，重启或空闲回收后自动恢复，不跨平台绑定身份或共享历史。
 - 同 Chat 顺序执行、不同 Chat 并行；共享审批与消息展示策略，Adapter 自行切分长文本。
 - 一个通道临时失败会独立退避重连，不停止另一个；一个永久失败也不影响另一个，全部永久失败才退出。Ctrl+C 统一取消。
 
@@ -307,6 +310,25 @@ compact
 ```
 
 Tool Error 属于 Agent 内部执行过程，只有最终任务失败才会向用户显示错误。
+
+---
+
+## Conversation 生命周期
+
+Gateway 可以持续运行；内存 Conversation 不必常驻。任务完成且队列清空后开始空闲计时，超时自动关闭 Session、释放 writer lock 和 worker，并从 Manager 移除。下一条消息重新创建引擎，从原 Durable Session 恢复历史（包括旧飞书 ChatID Session），不会开启空白会话或删除历史。
+
+在 `messaging` 中配置 `"conversation_idle_timeout": "30m"`：
+
+| 值 | 行为 |
+| --- | --- |
+| 缺失或 `""` | 默认 30 分钟 |
+| `"0"` | 禁用空闲回收 |
+| `"15m"` / `"1h"` 等正 duration | 使用指定空闲时长 |
+| 负数或非法 duration | 启动时报错 |
+
+Agent、工具、Subagent 和人工审批等待都属于 Active，不计入空闲时间；有排队消息也不会回收。关闭期间同 Chat 的新消息返回可重试 admission error，不发送 Accepted、不记去重；Adapter 重投成功后才接收。其他 Chat 不等待这次关闭。Ctrl+C 立即取消 idle timer，并等待 worker 退出和 writer 释放。
+
+`claw gateway -check-config` 会显示解析后的 timeout，但不启动 timer、Session、通道或 Sandbox。修改配置需重启 Gateway。完整设计与验收步骤见 [M5.5 报告](docs/M5.5-report.md)。
 
 ---
 

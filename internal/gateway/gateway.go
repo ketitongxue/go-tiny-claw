@@ -16,13 +16,17 @@ import (
 
 var ErrQueueFull = errors.New("当前会话队列已满，请稍后重试")
 
+// ErrConversationClosing is transient: retry after the old writer is released.
+var ErrConversationClosing = errors.New("conversation is closing; retry message")
+
 // Register adapters before Run. Approval is optional and scoped to this gateway.
 type Config struct {
-	Channels        *channel.Registry
-	ResolveSession  SessionResolver
-	Factory         RuntimeFactory
-	Approvals       *approval.ApprovalManager
-	ReportingPolicy delivery.ReportingPolicy
+	Channels                *channel.Registry
+	ResolveSession          SessionResolver
+	Factory                 RuntimeFactory
+	Approvals               *approval.ApprovalManager
+	ReportingPolicy         delivery.ReportingPolicy
+	ConversationIdleTimeout time.Duration // zero disables idle eviction
 }
 
 type Gateway struct {
@@ -42,10 +46,14 @@ func New(ctx context.Context, cfg Config) (*Gateway, error) {
 	if cfg.Channels == nil || cfg.ResolveSession == nil || cfg.Factory == nil {
 		return nil, errors.New("gateway requires channels, session resolver and runtime factory")
 	}
+	if cfg.ConversationIdleTimeout < 0 {
+		return nil, errors.New("conversation idle timeout must not be negative")
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	m := &ConversationManager{ctx: ctx, resolve: cfg.ResolveSession, factory: cfg.Factory,
 		delivery: delivery.NewService(cfg.Channels), approvals: cfg.Approvals,
-		reportingPolicy: cfg.ReportingPolicy, conversations: make(map[string]*Conversation)}
+		reportingPolicy: cfg.ReportingPolicy, idleTimeout: cfg.ConversationIdleTimeout,
+		conversations: make(map[string]*Conversation)}
 	return &Gateway{ctx: ctx, cancel: cancel, channels: cfg.Channels, conversations: m,
 		retry: defaultAdapterRetryPolicy(), commands: commandRouter{approvals: cfg.Approvals, conversations: m}}, nil
 }
@@ -109,21 +117,12 @@ func (g *Gateway) admit(ctx context.Context, msg channel.InboundMessage) (func(c
 	if msg.ChatType == channel.ChatGroup && !msg.MentionedBot {
 		return nil, nil
 	}
-	c, err := g.conversations.getOrCreate(msg.Route)
+	notifyAccepted, err := g.conversations.enqueue(ctx, msg)
 	if err != nil {
 		return nil, err
 	}
-	// Reserve output order before the worker can consume the message. This is
-	// presentation-only bookkeeping: it never waits on or sends to an adapter.
-	notifyAccepted, discardAccepted := c.reporter.PrepareAccepted()
-	select {
-	case c.queue <- msg:
-		g.dedup.remember(key, now)
-		return notifyAccepted, nil
-	default:
-		discardAccepted()
-		return nil, ErrQueueFull
-	}
+	g.dedup.remember(key, now)
+	return notifyAccepted, nil
 }
 
 // ConversationCount is a synchronized runtime diagnostic, without identities.
