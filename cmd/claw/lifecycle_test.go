@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -87,7 +88,7 @@ func TestModelSetPreservesMessagingLifecycleConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded, err := config.Load(path)
-	if err != nil || loaded != cfg {
+	if err != nil || !reflect.DeepEqual(loaded, cfg) {
 		t.Fatal("model set lost channels/report mode/idle timeout", loaded, err)
 	}
 }

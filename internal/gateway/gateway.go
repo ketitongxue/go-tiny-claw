@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/access"
 	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	"github.com/ketitongxue/go-tiny-claw/internal/delivery"
@@ -19,12 +21,13 @@ var ErrQueueFull = errors.New("当前会话队列已满，请稍后重试")
 // ErrConversationClosing is transient: retry after the old writer is released.
 var ErrConversationClosing = errors.New("conversation is closing; retry message")
 
-// Register adapters before Run. Approval is optional and scoped to this gateway.
+// Register adapters before New. Approval is optional and scoped to this gateway.
 type Config struct {
 	Channels                *channel.Registry
 	ResolveSession          SessionResolver
 	Factory                 RuntimeFactory
 	Approvals               *approval.ApprovalManager
+	Authorizer              *access.Authorizer // nil: legacy open for registered default accounts
 	ReportingPolicy         delivery.ReportingPolicy
 	ConversationIdleTimeout time.Duration // zero disables idle eviction
 }
@@ -33,6 +36,7 @@ type Gateway struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	channels      *channel.Registry
+	authorizer    *access.Authorizer
 	conversations *ConversationManager
 	commands      commandRouter
 	mu            sync.Mutex
@@ -49,13 +53,29 @@ func New(ctx context.Context, cfg Config) (*Gateway, error) {
 	if cfg.ConversationIdleTimeout < 0 {
 		return nil, errors.New("conversation idle timeout must not be negative")
 	}
+	if cfg.Authorizer == nil {
+		policies := make(map[access.Scope]access.Policy)
+		for _, a := range cfg.Channels.All() {
+			policies[access.Scope{Channel: a.ID(), AccountID: "default"}] = access.Policy{Mode: access.ModeOpen}
+		}
+		var err error
+		cfg.Authorizer, err = access.NewAuthorizer(policies)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, scope := range cfg.Authorizer.OpenScopes() {
+		if _, registered := cfg.Channels.Get(scope.Channel); registered {
+			log.Printf("[Access] WARNING: channel %s access mode is open account=%s; use restricted for production", scope.Channel, scope.AccountID)
+		}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	m := &ConversationManager{ctx: ctx, resolve: cfg.ResolveSession, factory: cfg.Factory,
 		delivery: delivery.NewService(cfg.Channels), approvals: cfg.Approvals,
 		reportingPolicy: cfg.ReportingPolicy, idleTimeout: cfg.ConversationIdleTimeout,
 		conversations: make(map[string]*Conversation)}
-	return &Gateway{ctx: ctx, cancel: cancel, channels: cfg.Channels, conversations: m,
-		retry: defaultAdapterRetryPolicy(), commands: commandRouter{approvals: cfg.Approvals, conversations: m}}, nil
+	return &Gateway{ctx: ctx, cancel: cancel, channels: cfg.Channels, authorizer: cfg.Authorizer, conversations: m,
+		retry: defaultAdapterRetryPolicy(), commands: commandRouter{approvals: cfg.Approvals, conversations: m, authorizer: cfg.Authorizer}}, nil
 }
 
 // Receive acknowledges acceptance, not completion. Event callback cancellation
@@ -76,6 +96,10 @@ func (g *Gateway) Receive(ctx context.Context, msg channel.InboundMessage) error
 	}
 	if _, ok := g.channels.Get(msg.Route.Channel); !ok {
 		return fmt.Errorf("channel %q is not registered", msg.Route.Channel)
+	}
+	if d := g.authorizer.CanUse(msg); !d.Allowed {
+		logAccessDenied(msg, d.Reason)
+		return nil
 	}
 	notifyAccepted, err := g.admit(ctx, msg)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/access"
 	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
@@ -50,6 +51,12 @@ func TestLegacyResumeApprovalAndRestartKeepActualIDModelHistory(t *testing.T) {
 	if err := old.Close(); err != nil {
 		t.Fatal(err)
 	}
+	auth, err := access.NewAuthorizer(map[access.Scope]access.Policy{{Channel: "test", AccountID: "default"}: {
+		Mode: access.ModeRestricted, Operators: []string{"100"}, Approvers: []string{"100"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := range 2 {
 		// Use a fresh store/service, as a process restart would.
 		store, err := sessionstore.NewFileStore(sessionDir)
@@ -64,7 +71,7 @@ func TestLegacyResumeApprovalAndRestartKeepActualIDModelHistory(t *testing.T) {
 		}
 		sessions := make(chan *ctxpkg.Session, 1)
 		results := make(chan bool, 1)
-		g, err := New(ctx, Config{Channels: registry, ResolveSession: resolver.Resolve, Approvals: approval.NewApprovalManager(),
+		g, err := New(ctx, Config{Channels: registry, ResolveSession: resolver.Resolve, Authorizer: auth, Approvals: approval.NewApprovalManager(),
 			Factory: func(_ context.Context, s *ctxpkg.Session, _ channel.Route, _ engine.Reporter, approvals *approval.Service) (AgentRunner, error) {
 				sessions <- s
 				return runnerFunc(func(ctx context.Context, _ *ctxpkg.Session, _ engine.Reporter) error {
@@ -78,13 +85,16 @@ func TestLegacyResumeApprovalAndRestartKeepActualIDModelHistory(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = g.Shutdown() })
 		msg := inbound("old-chat", fmt.Sprint(i), "continue")
+		msg.UserID = "100"
 		admit(t, g, msg)
 		s := receive(t, sessions)
 		if s.ID != "old-chat" || s.ModelRef().String() != "fake/old-model" || s.GetWorkingMemory(0)[0].Content != "ABC123" {
 			t.Fatal("legacy session forked or lost model/history")
 		}
 		receiveTaskReport(t, a)
-		admit(t, g, inbound("old-chat", "approval", "approve task"))
+		control := inbound("old-chat", "approval", "approve task")
+		control.UserID = "100"
+		admit(t, g, control)
 		if !receive(t, results) {
 			t.Fatal("router used canonical instead of actual legacy approval ID")
 		}

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -16,7 +17,7 @@ func TestChannelConfigDefaultsAndRoundTrip(t *testing.T) {
 			}
 		}
 		cfg, err := Load(path)
-		if err != nil || cfg.Channels != (ChannelsConfig{}) {
+		if err != nil || !reflect.DeepEqual(cfg.Channels, ChannelsConfig{}) {
 			t.Fatalf("legacy config enabled a channel: %+v, %v", cfg, err)
 		}
 	}
@@ -30,7 +31,7 @@ func TestChannelConfigDefaultsAndRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 		loaded, err := Load(path)
-		if err != nil || loaded != cfg {
+		if err != nil || !reflect.DeepEqual(loaded, cfg) {
 			t.Fatalf("config changed: %+v, %v", loaded, err)
 		}
 	}

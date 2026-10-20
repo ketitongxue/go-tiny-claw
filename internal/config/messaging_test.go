@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -50,7 +51,7 @@ func TestMessagingConfigRoundTripAndValidation(t *testing.T) {
 			t.Fatal(err)
 		}
 		loaded, err := Load(path)
-		if err != nil || loaded != c {
+		if err != nil || !reflect.DeepEqual(loaded, c) {
 			t.Fatalf("round trip changed config: %+v, %v", loaded, err)
 		}
 	}

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -14,7 +15,7 @@ func TestResponseLanguageConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded, err := Load(path)
-	if err != nil || loaded != c {
+	if err != nil || !reflect.DeepEqual(loaded, c) {
 		t.Fatal(loaded, err)
 	}
 	for _, language := range []string{"en\nInjected", strings.Repeat("a", 65)} {

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -24,7 +25,7 @@ func TestConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded, err := Load(paths.Config)
-	if err != nil || loaded != c {
+	if err != nil || !reflect.DeepEqual(loaded, c) {
 		t.Fatal(loaded, err)
 	}
 	for _, value := range []string{"glm-5.3", "zai-coding-cn/glm-5.3"} {
@@ -37,7 +38,7 @@ func TestConfig(t *testing.T) {
 		t.Fatal("bad model saved")
 	}
 	loaded, err = Load(paths.Config)
-	if err != nil || loaded != c {
+	if err != nil || !reflect.DeepEqual(loaded, c) {
 		t.Fatal("failed save damaged config")
 	}
 	files, _ := filepath.Glob(filepath.Join(paths.Home, "*.tmp"))

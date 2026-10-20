@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -34,7 +35,7 @@ func TestGatewayCommandAndChannelSelection(t *testing.T) {
 		{"demo", config.ChannelsConfig{}},
 	} {
 		got, err := channelsForMode(tc.mode, both)
-		if err != nil || got != tc.want {
+		if err != nil || !reflect.DeepEqual(got, tc.want) {
 			t.Fatal(tc.mode, got, err)
 		}
 	}

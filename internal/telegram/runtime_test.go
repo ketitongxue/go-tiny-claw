@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/access"
 	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
@@ -113,6 +114,11 @@ func (g *runningGateway) stop(t *testing.T) {
 
 func serveGateway(t *testing.T, api *botAPI, store sessionstore.Store, dir string, mode delivery.ReportMode, factory gateway.RuntimeFactory, others ...channel.Adapter) *runningGateway {
 	t.Helper()
+	return serveGatewayWithAccess(t, api, store, dir, mode, factory, nil, others...)
+}
+
+func serveGatewayWithAccess(t *testing.T, api *botAPI, store sessionstore.Store, dir string, mode delivery.ReportMode, factory gateway.RuntimeFactory, authorizer *access.Authorizer, others ...channel.Adapter) *runningGateway {
+	t.Helper()
 	registry := channel.NewRegistry()
 	for _, a := range append([]channel.Adapter{api.adapter}, others...) {
 		if err := registry.Register(a); err != nil {
@@ -124,7 +130,7 @@ func serveGateway(t *testing.T, api *botAPI, store sessionstore.Store, dir strin
 		return svc.Create(ctx, id, dir, provider.ModelInfo{ProviderID: "fake", ID: "pinned"}, "none")
 	}}
 	g, err := gateway.New(context.Background(), gateway.Config{Channels: registry, ResolveSession: sessions.Resolve,
-		Factory: factory, Approvals: approval.NewApprovalManager(), ReportingPolicy: delivery.ReportingPolicy{Mode: mode}})
+		Factory: factory, Approvals: approval.NewApprovalManager(), Authorizer: authorizer, ReportingPolicy: delivery.ReportingPolicy{Mode: mode}})
 	if err != nil {
 		t.Fatal(err)
 	}

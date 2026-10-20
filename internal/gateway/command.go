@@ -4,6 +4,7 @@ import (
 	"log"
 	"strings"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/access"
 	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 )
@@ -11,6 +12,7 @@ import (
 type commandRouter struct {
 	approvals     *approval.ApprovalManager
 	conversations *ConversationManager
+	authorizer    *access.Authorizer
 }
 
 // handle runs before group admission and enqueue: the worker may currently be
@@ -20,6 +22,10 @@ func (r commandRouter) handle(msg channel.InboundMessage) bool {
 	fields := strings.Fields(msg.Text)
 	if len(fields) == 0 || (fields[0] != "approve" && fields[0] != "reject") {
 		return false
+	}
+	if d := r.authorizer.CanApprove(msg); !d.Allowed {
+		logAccessDenied(msg, d.Reason)
+		return true
 	}
 	if len(fields) == 2 {
 		allowed := fields[0] == "approve"
@@ -32,4 +38,8 @@ func (r commandRouter) handle(msg channel.InboundMessage) bool {
 		log.Printf("[Gateway] 审批指令已处理: matched=%t allowed=%t", resolved, allowed)
 	}
 	return true
+}
+
+func logAccessDenied(msg channel.InboundMessage, reason access.Reason) {
+	log.Printf("[Access] denied channel=%s account=%s reason=%s", msg.Route.Channel, msg.Route.AccountID, reason)
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/access"
 	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
@@ -98,6 +99,11 @@ func receiveTaskReport(t *testing.T, a *fakeAdapter) sentMessage {
 
 func testGateway(t *testing.T, factory RuntimeFactory, policies ...delivery.ReportingPolicy) (*Gateway, *fakeAdapter, *sessionstore.MemoryStore) {
 	t.Helper()
+	return testGatewayWithAccess(t, factory, nil, policies...)
+}
+
+func testGatewayWithAccess(t *testing.T, factory RuntimeFactory, authorizer *access.Authorizer, policies ...delivery.ReportingPolicy) (*Gateway, *fakeAdapter, *sessionstore.MemoryStore) {
+	t.Helper()
 	a := newFakeAdapter("test")
 	registry := channel.NewRegistry()
 	if err := registry.Register(a); err != nil {
@@ -114,7 +120,7 @@ func testGateway(t *testing.T, factory RuntimeFactory, policies ...delivery.Repo
 		policy = policies[0]
 	}
 	g, err := New(context.Background(), Config{Channels: registry, ResolveSession: sessions.Resolve, Factory: factory,
-		Approvals: approval.NewApprovalManager(), ReportingPolicy: policy})
+		Approvals: approval.NewApprovalManager(), Authorizer: authorizer, ReportingPolicy: policy})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,10 +221,18 @@ func TestConversationsAreOrderedIsolatedAndConcurrent(t *testing.T) {
 }
 
 func TestDedupIsAtomicAndChannelAccountScoped(t *testing.T) {
-	runs := make(chan string, 20)
-	g, _, _ := testGateway(t, func(_ context.Context, _ *ctxpkg.Session, _ channel.Route, _ engine.Reporter, _ *approval.Service) (AgentRunner, error) {
-		return runnerFunc(func(_ context.Context, s *ctxpkg.Session, _ engine.Reporter) error { runs <- s.ID; return nil }), nil
+	auth, err := access.NewAuthorizer(map[access.Scope]access.Policy{
+		{Channel: "test", AccountID: "default"}:  {},
+		{Channel: "test", AccountID: "another"}:  {},
+		{Channel: "other", AccountID: "default"}: {},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := make(chan string, 20)
+	g, _, _ := testGatewayWithAccess(t, func(_ context.Context, _ *ctxpkg.Session, _ channel.Route, _ engine.Reporter, _ *approval.Service) (AgentRunner, error) {
+		return runnerFunc(func(_ context.Context, s *ctxpkg.Session, _ engine.Reporter) error { runs <- s.ID; return nil }), nil
+	}, auth)
 	if err := g.channels.Register(newFakeAdapter("other")); err != nil {
 		t.Fatal(err)
 	}

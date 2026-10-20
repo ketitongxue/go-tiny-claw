@@ -8,6 +8,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/access"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
 	"github.com/ketitongxue/go-tiny-claw/internal/delivery"
 	"github.com/ketitongxue/go-tiny-claw/internal/fileutil"
@@ -43,12 +44,33 @@ func (c MessagingConfig) ReportingPolicy() (delivery.ReportingPolicy, error) {
 
 // ChannelConfig contains no credentials. Secrets are read from the environment.
 type ChannelConfig struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool         `json:"enabled"`
+	Access  AccessConfig `json:"access,omitempty"`
+}
+
+type AccessConfig struct {
+	Mode       string   `json:"mode,omitempty"`
+	Operators  []string `json:"operators,omitempty"`
+	Approvers  []string `json:"approvers,omitempty"`
+	GroupChats []string `json:"group_chats,omitempty"`
 }
 
 type ChannelsConfig struct {
 	Feishu   ChannelConfig `json:"feishu,omitempty"`
 	Telegram ChannelConfig `json:"telegram,omitempty"`
+}
+
+// Authorizer validates all configured policies, including disabled channels.
+// Gateway separately checks channel registration before consulting these scopes.
+func (c ChannelsConfig) Authorizer() (*access.Authorizer, error) {
+	policies := make(map[access.Scope]access.Policy)
+	for name, cfg := range map[string]ChannelConfig{"feishu": c.Feishu, "telegram": c.Telegram} {
+		policies[access.Scope{Channel: name, AccountID: "default"}] = access.Policy{
+			Mode: access.Mode(cfg.Access.Mode), Operators: cfg.Access.Operators,
+			Approvers: cfg.Access.Approvers, GroupChats: cfg.Access.GroupChats,
+		}
+	}
+	return access.NewAuthorizer(policies)
 }
 
 type Config struct {
@@ -77,6 +99,9 @@ func Load(path string) (Config, error) {
 	if _, err := c.Messaging.IdleTimeout(); err != nil {
 		return c, err
 	}
+	if _, err := c.Channels.Authorizer(); err != nil {
+		return c, err
+	}
 	if c.Context.DefaultContextWindow < 0 || c.Context.DefaultReservedOutput < 0 || c.Context.MaxToolResultTokens < 0 || c.Context.SafetyMarginPercent < 0 || c.Context.SafetyMarginPercent >= 100 {
 		return c, errors.New("invalid context policy")
 	}
@@ -100,6 +125,9 @@ func Save(path string, c Config) error {
 		return err
 	}
 	if _, err := c.Messaging.IdleTimeout(); err != nil {
+		return err
+	}
+	if _, err := c.Channels.Authorizer(); err != nil {
 		return err
 	}
 	if _, err := provider.ParseModelRef(c.DefaultModel); err != nil {

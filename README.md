@@ -30,6 +30,7 @@
 | AGENTS / SYSTEM / Skills | ✅ |
 | Project Trust | ✅ |
 | Messaging Gateway | ✅ |
+| 跨平台独立的 Operator / Approver / 群聊 allowlist | ✅ |
 | 飞书长连接 / Telegram Long Polling（文本） | ✅ |
 | 多通道同时在线 / 独立重连 | ✅ |
 | 多会话并行 | ✅ |
@@ -237,13 +238,31 @@ claw session delete <session-id>
 
 # Messaging Gateway：飞书 + Telegram
 
-在 `~/.claw/config.json` 中合并以下配置（保留已有模型等设置）：
+**推荐使用 `restricted` 作为生产访问模式。`open` 仅为向后兼容，未配置 `access` 或 mode 为空时默认 open，任何能向 bot 发消息的人都可能提交任务或审批。**
+
+在 `~/.claw/config.json` 中合并以下配置（保留已有模型等设置，并替换示例 ID）：
 
 ```json
 {
   "channels": {
-    "feishu": { "enabled": true },
-    "telegram": { "enabled": true }
+    "feishu": {
+      "enabled": true,
+      "access": {
+        "mode": "restricted",
+        "operators": ["ou_your_open_id"],
+        "approvers": ["ou_your_open_id"],
+        "group_chats": ["oc_your_group_chat_id"]
+      }
+    },
+    "telegram": {
+      "enabled": true,
+      "access": {
+        "mode": "restricted",
+        "operators": ["123456789"],
+        "approvers": ["123456789"],
+        "group_chats": ["-100123456789"]
+      }
+    }
   },
   "messaging": {
     "report_mode": "compact",
@@ -264,14 +283,30 @@ claw gateway -workdir ./workspace
 
 可仅启用其中一个通道。未配置 / 未启用任何通道时，`claw gateway` 明确报错，不自动猜测。旧的 `claw -mode feishu` 暂时保留并打印弃用警告，始终只启动飞书；`claw -mode demo` 不变。
 
-- 两个平台同时在线，私聊直接对话；群聊 `@bot`，Telegram 也支持回复 bot 的消息。
+- 两个平台同时在线；通过访问授权后，私聊直接对话，群聊 `@bot`，Telegram 也支持回复 bot 的消息。
 - 不同 Channel / Chat 独立 Durable Session，重启或空闲回收后自动恢复，不跨平台绑定身份或共享历史。
 - 同 Chat 顺序执行、不同 Chat 并行；共享审批与消息展示策略，Adapter 自行切分长文本。
 - 一个通道临时失败会独立退避重连，不停止另一个；一个永久失败也不影响另一个，全部永久失败才退出。Ctrl+C 统一取消。
 
 Telegram 使用 BotFather 创建的 Bot Token，仅 Long Polling + 纯文本。已有 webhook 会明确拒绝启动，**不会自动 deleteWebhook**；请自行移除 webhook，并确保同一 token 只有一个 update consumer。群聊开启 Privacy Mode 时，请通过 `@bot` 或回复 bot 交互；审批文本也应回复 bot 的消息。
 
-机器人仅供可信用户使用；当前没有用户 / Chat allowlist 或管理员身份校验，审批作用域是会话，不是用户权限。
+## Messaging Access Control
+
+**Human Approval != User Authorization（人工确认不等于用户授权）。** Access Policy 决定谁能提交任务、哪些群可用、谁可审批；Human Approval 决定一个具体危险操作是否被允许，两者不能互相替代，也不能替代 Sandbox。
+
+| 模式 | 普通任务 | `approve` / `reject` |
+| --- | --- | --- |
+| `open`（缺省兼容模式） | 保持旧行为，不检查用户 / 群 allowlist | 保持旧行为，只匹配 Route / Session / Task |
+| `restricted`（推荐） | 私聊要求 UserID 在 `operators`；群聊还要求 ChatID 在 `group_chats` | 先满足普通访问授权，再要求 UserID 在 `approvers`，并匹配 Route / Session / Task |
+
+- 身份只使用 **稳定 UserID**：Telegram 为数字 `user.id` 的字符串，飞书为 sender `open_id`。不能填写 Telegram username、飞书显示名或用 ChatID 代替 UserID；缺少 UserID 时 restricted 一律拒绝。
+- 策略按 **Channel + AccountID** 隔离（当前 account 为 `default`）；即使两个平台 ID 文本相同也不共享权限。授权用户把 bot 加入其他群，不会自动开放该群。
+- restricted 的 `operators` 必须非空；`approvers` 必须是其子集。`approvers: []` 合法，表示允许普通任务、禁止所有人工审批；`group_chats: []` 表示仅私聊可用。
+- ID 去除首尾空白、内部构建集合去重，**不转换大小写**。列表中的空 / 纯空白 ID、未知 mode / 字段会导致配置校验失败。配置只在启动时构建，修改后须重启；`claw model set` 保留 access 配置。旧 `-mode feishu` 同样遵守飞书 access 策略。
+- 未授权消息静默 acknowledge，不创建 Conversation / Session、不获取 writer、不发送 Accepted、不调用模型。非 Approver 的审批命令以及 malformed control 均消费，不会成为模型输入；审批仍绕过普通 FIFO，不会因队列满而死锁。
+- 启用的 open 通道在 Gateway 构建时仅警告一次，例如 `WARNING: channel telegram access mode is open account=default`，不逐条重复。拒绝日志只记录 channel / account / typed reason，不记录 UserID、ChatID、消息正文或 token。
+
+完整设计、测试覆盖和真实平台人工验收步骤见 [M5.6 报告](docs/M5.6-report.md)。
 
 ---
 
@@ -348,8 +383,8 @@ reject <task-id>
 
 审批：
 
-- 与 Session 绑定
-- 其他 Conversation 不能代为批准
+- 绑定 Route + Session + Task；restricted 还要求发送者通过 Access Policy 且在 Approvers 中
+- 其他 Conversation 不能代为批准；同群 Operator 也不自动拥有 Approver 权限
 - 默认超时拒绝
 - Cancel 后自动拒绝
 - 不经过普通任务队列

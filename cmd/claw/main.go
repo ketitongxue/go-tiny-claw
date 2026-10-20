@@ -249,6 +249,10 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 	if err != nil {
 		return err
 	}
+	authorizer, err := enabledChannels.Authorizer()
+	if err != nil {
+		return err
+	}
 	if err := validateEnvironment(enabledChannels, os.Getenv); err != nil {
 		return err
 	}
@@ -367,7 +371,7 @@ func run(ctx context.Context, args []string, output io.Writer) (runErr error) {
 				return service.Create(callCtx, id, opts.workDir, selected, string(info.Type))
 			}}
 		gw, err := gateway.New(ctx, gateway.Config{Channels: channels, ResolveSession: sessions.Resolve,
-			Factory: factory, Approvals: approval.NewApprovalManager(), ReportingPolicy: reportingPolicy,
+			Factory: factory, Approvals: approval.NewApprovalManager(), Authorizer: authorizer, ReportingPolicy: reportingPolicy,
 			ConversationIdleTimeout: idleTimeout})
 		if err != nil {
 			return err

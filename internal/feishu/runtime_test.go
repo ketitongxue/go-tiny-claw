@@ -7,6 +7,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/ketitongxue/go-tiny-claw/internal/access"
 	"github.com/ketitongxue/go-tiny-claw/internal/approval"
 	"github.com/ketitongxue/go-tiny-claw/internal/channel"
 	ctxpkg "github.com/ketitongxue/go-tiny-claw/internal/context"
@@ -69,7 +70,7 @@ func legacyID(route channel.Route) string {
 	return ""
 }
 
-func newTestRuntime(t *testing.T, dir string, resolver gateway.SessionResolver, factory gateway.RuntimeFactory, approvals *approval.ApprovalManager) *testRuntime {
+func newTestRuntime(t *testing.T, dir string, resolver gateway.SessionResolver, factory gateway.RuntimeFactory, approvals *approval.ApprovalManager, authorizers ...*access.Authorizer) *testRuntime {
 	t.Helper()
 	a, err := NewAdapter()
 	if err != nil {
@@ -84,8 +85,12 @@ func newTestRuntime(t *testing.T, dir string, resolver gateway.SessionResolver, 
 	}
 	// Legacy adapter regressions explicitly exercise verbose rendering. Compact
 	// presentation is covered at the channel-independent Gateway boundary.
+	var authorizer *access.Authorizer
+	if len(authorizers) != 0 {
+		authorizer = authorizers[0]
+	}
 	g, err := gateway.New(ctx, gateway.Config{Channels: registry, ResolveSession: resolver, Factory: factory,
-		Approvals: approvals, ReportingPolicy: delivery.ReportingPolicy{Mode: delivery.ReportModeVerbose}})
+		Approvals: approvals, Authorizer: authorizer, ReportingPolicy: delivery.ReportingPolicy{Mode: delivery.ReportModeVerbose}})
 	if err != nil {
 		cancel()
 		t.Fatal(err)

@@ -17,7 +17,9 @@ func channelsForMode(mode string, configured config.ChannelsConfig) (config.Chan
 		return config.ChannelsConfig{}, nil
 	case "feishu":
 		// Legacy startup must not implicitly activate new configured channels.
-		return config.ChannelsConfig{Feishu: config.ChannelConfig{Enabled: true}}, nil
+		feishu := configured.Feishu
+		feishu.Enabled = true // Preserve access policy even through legacy startup.
+		return config.ChannelsConfig{Feishu: feishu}, nil
 	case "gateway":
 		if configured.Feishu.Enabled || configured.Telegram.Enabled {
 			return configured, nil
