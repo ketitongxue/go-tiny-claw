@@ -14,7 +14,12 @@ import (
 // Platform smoke is separate from the backend-agnostic security contract:
 // a usable system Go SDK is a workload dependency, not an Executor capability.
 func TestNativeIntegrationToolchain(t *testing.T) {
-	e := integrationNative(t, CodingPolicy())
+	// Each invocation cold-builds with a fresh private HOME/build cache.
+	// Give this toolchain smoke its own compilation budget; default timeout
+	// enforcement remains covered by the shared contract and cleanup tests.
+	policy := CodingPolicy()
+	policy.Timeout = 2 * time.Minute
+	e := integrationNative(t, policy)
 	work := t.TempDir()
 	for name, content := range map[string]string{
 		"go.mod":      "module nativesmoke\n\ngo 1.26.2\n",
